@@ -1,6 +1,6 @@
 import { CanActivate } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
-import { Controller } from '@nestjs/common/interfaces';
+import { Controller, Type } from '@nestjs/common/interfaces';
 import { isEmpty, isFunction } from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
 import { ApplicationConfig } from '../application-config';
@@ -54,27 +54,29 @@ export class GuardsContextCreator extends ContextCreator {
   }
 
   public getGuardInstance(
-    guard: Function | CanActivate,
+    metatype: Function | CanActivate,
     contextId = STATIC_CONTEXT,
     inquirerId?: string,
   ): CanActivate | null {
-    const isObject = (guard as CanActivate).canActivate;
+    const isObject = (metatype as CanActivate).canActivate;
     if (isObject) {
-      return guard as CanActivate;
+      return metatype as CanActivate;
     }
-    const instanceWrapper = this.getInstanceByMetatype(guard);
+    const instanceWrapper = this.getInstanceByMetatype(
+      metatype as Type<unknown>,
+    );
     if (!instanceWrapper) {
       return null;
     }
     const instanceHost = instanceWrapper.getInstanceByContextId(
-      contextId,
+      this.getContextId(contextId, instanceWrapper),
       inquirerId,
     );
     return instanceHost && instanceHost.instance;
   }
 
-  public getInstanceByMetatype<T extends Record<string, any> | Function>(
-    guard: T,
+  public getInstanceByMetatype(
+    metatype: Type<unknown>,
   ): InstanceWrapper | undefined {
     if (!this.moduleContext) {
       return;
@@ -85,7 +87,7 @@ export class GuardsContextCreator extends ContextCreator {
       return;
     }
     const injectables = moduleRef.injectables;
-    return injectables.get(guard.name as string);
+    return injectables.get(metatype);
   }
 
   public getGlobalMetadata<T extends unknown[]>(
@@ -99,9 +101,15 @@ export class GuardsContextCreator extends ContextCreator {
     if (contextId === STATIC_CONTEXT && !inquirerId) {
       return globalGuards;
     }
-    const scopedGuardWrappers = this.config.getGlobalRequestGuards() as InstanceWrapper[];
+    const scopedGuardWrappers =
+      this.config.getGlobalRequestGuards() as InstanceWrapper[];
     const scopedGuards = iterate(scopedGuardWrappers)
-      .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
+      .map(wrapper =>
+        wrapper.getInstanceByContextId(
+          this.getContextId(contextId, wrapper),
+          inquirerId,
+        ),
+      )
       .filter(host => !!host)
       .map(host => host.instance)
       .toArray();

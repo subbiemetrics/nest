@@ -15,8 +15,13 @@ import { ApplicationConfig } from './application-config';
 import { MESSAGES } from './constants';
 import { ExceptionsZone } from './errors/exceptions-zone';
 import { loadAdapter } from './helpers/load-adapter';
+import { rethrow } from './helpers/rethrow';
 import { NestContainer } from './injector/container';
+import { Injector } from './injector/injector';
 import { InstanceLoader } from './injector/instance-loader';
+import { GraphInspector } from './inspector/graph-inspector';
+import { NoopGraphInspector } from './inspector/noop-graph-inspector';
+import { UuidFactory, UuidFactoryMode } from './inspector/uuid-factory';
 import { MetadataScanner } from './metadata-scanner';
 import { NestApplication } from './nest-application';
 import { NestApplicationContext } from './nest-application-context';
@@ -26,7 +31,12 @@ import { DependenciesScanner } from './scanner';
  * @publicApi
  */
 export class NestFactoryStatic {
-  private readonly logger = new Logger('NestFactory', true);
+  private readonly logger = new Logger('NestFactory', {
+    timestamp: true,
+  });
+  private abortOnError = true;
+  private autoFlushLogs = false;
+
   /**
    * Creates an instance of NestApplication.
    *
@@ -57,7 +67,7 @@ export class NestFactoryStatic {
     options?: NestApplicationOptions,
   ): Promise<T>;
   public async create<T extends INestApplication = INestApplication>(
-    module: any,
+    moduleCls: any,
     serverOrOptions?: AbstractHttpAdapter | NestApplicationOptions,
     options?: NestApplicationOptions,
   ): Promise<T> {
@@ -67,14 +77,25 @@ export class NestFactoryStatic {
 
     const applicationConfig = new ApplicationConfig();
     const container = new NestContainer(applicationConfig);
+    const graphInspector = this.createGraphInspector(appOptions, container);
 
-    this.applyLogger(appOptions);
-    await this.initialize(module, container, applicationConfig, httpServer);
+    this.setAbortOnError(serverOrOptions, options);
+    this.registerLoggerConfiguration(appOptions);
+
+    await this.initialize(
+      moduleCls,
+      container,
+      graphInspector,
+      applicationConfig,
+      appOptions,
+      httpServer,
+    );
 
     const instance = new NestApplication(
       container,
       httpServer,
       applicationConfig,
+      graphInspector,
       appOptions,
     );
     const target = this.createNestInstance(instance);
@@ -84,14 +105,14 @@ export class NestFactoryStatic {
   /**
    * Creates an instance of NestMicroservice.
    *
-   * @param module Entry (root) application module class
+   * @param moduleCls Entry (root) application module class
    * @param options Optional microservice configuration
    *
    * @returns A promise that, when resolved,
    * contains a reference to the NestMicroservice instance.
    */
   public async createMicroservice<T extends object>(
-    module: any,
+    moduleCls: any,
     options?: NestMicroserviceOptions & T,
   ): Promise<INestMicroservice> {
     const { NestMicroservice } = loadPackage(
@@ -101,38 +122,65 @@ export class NestFactoryStatic {
     );
     const applicationConfig = new ApplicationConfig();
     const container = new NestContainer(applicationConfig);
+    const graphInspector = this.createGraphInspector(options, container);
 
-    this.applyLogger(options);
+    this.setAbortOnError(options);
+    this.registerLoggerConfiguration(options);
 
-    await this.initialize(module, container, applicationConfig);
+    await this.initialize(
+      moduleCls,
+      container,
+      graphInspector,
+      applicationConfig,
+      options,
+    );
     return this.createNestInstance<INestMicroservice>(
-      new NestMicroservice(container, options, applicationConfig),
+      new NestMicroservice(
+        container,
+        options,
+        graphInspector,
+        applicationConfig,
+      ),
     );
   }
 
   /**
    * Creates an instance of NestApplicationContext.
    *
-   * @param module Entry (root) application module class
+   * @param moduleCls Entry (root) application module class
    * @param options Optional Nest application configuration
    *
    * @returns A promise that, when resolved,
    * contains a reference to the NestApplicationContext instance.
    */
   public async createApplicationContext(
-    module: any,
+    moduleCls: any,
     options?: NestApplicationContextOptions,
   ): Promise<INestApplicationContext> {
-    const container = new NestContainer();
+    const applicationConfig = new ApplicationConfig();
+    const container = new NestContainer(applicationConfig);
+    const graphInspector = this.createGraphInspector(options, container);
 
-    this.applyLogger(options);
-    await this.initialize(module, container);
+    this.setAbortOnError(options);
+    this.registerLoggerConfiguration(options);
+
+    await this.initialize(
+      moduleCls,
+      container,
+      graphInspector,
+      applicationConfig,
+      options,
+    );
 
     const modules = container.getModules().values();
     const root = modules.next().value;
+
     const context = this.createNestInstance<NestApplicationContext>(
-      new NestApplicationContext(container, [], root),
+      new NestApplicationContext(container, options, root),
     );
+    if (this.autoFlushLogs) {
+      context.flushLogsOnOverride();
+    }
     return context.init();
   }
 
@@ -143,29 +191,54 @@ export class NestFactoryStatic {
   private async initialize(
     module: any,
     container: NestContainer,
+    graphInspector: GraphInspector,
     config = new ApplicationConfig(),
+    options: NestApplicationContextOptions = {},
     httpServer: HttpServer = null,
   ) {
-    const instanceLoader = new InstanceLoader(container);
+    UuidFactory.mode = options.snapshot
+      ? UuidFactoryMode.Deterministic
+      : UuidFactoryMode.Random;
+
+    const injector = new Injector({ preview: options.preview });
+    const instanceLoader = new InstanceLoader(
+      container,
+      injector,
+      graphInspector,
+    );
     const metadataScanner = new MetadataScanner();
     const dependenciesScanner = new DependenciesScanner(
       container,
       metadataScanner,
+      graphInspector,
       config,
     );
     container.setHttpAdapter(httpServer);
 
+    const teardown = this.abortOnError === false ? rethrow : undefined;
     await httpServer?.init();
     try {
       this.logger.log(MESSAGES.APPLICATION_START);
-      await ExceptionsZone.asyncRun(async () => {
-        await dependenciesScanner.scan(module);
-        await instanceLoader.createInstancesOfDependencies();
-        dependenciesScanner.applyApplicationProviders();
-      });
+
+      await ExceptionsZone.asyncRun(
+        async () => {
+          await dependenciesScanner.scan(module);
+          await instanceLoader.createInstancesOfDependencies();
+          dependenciesScanner.applyApplicationProviders();
+        },
+        teardown,
+        this.autoFlushLogs,
+      );
     } catch (e) {
+      this.handleInitializationError(e);
+    }
+  }
+
+  private handleInitializationError(err: unknown) {
+    if (this.abortOnError) {
       process.abort();
     }
+    rethrow(err);
   }
 
   private createProxy(target: any) {
@@ -192,20 +265,32 @@ export class NestFactoryStatic {
     receiver: Record<string, any>,
     prop: string,
   ): Function {
+    const teardown = this.abortOnError === false ? rethrow : undefined;
+
     return (...args: unknown[]) => {
       let result: unknown;
       ExceptionsZone.run(() => {
         result = receiver[prop](...args);
-      });
+      }, teardown);
+
       return result;
     };
   }
 
-  private applyLogger(options: NestApplicationContextOptions | undefined) {
+  private registerLoggerConfiguration(
+    options: NestApplicationContextOptions | undefined,
+  ) {
     if (!options) {
       return;
     }
-    !isNil(options.logger) && Logger.overrideLogger(options.logger);
+    const { logger, bufferLogs, autoFlushLogs } = options;
+    if ((logger as boolean) !== true && !isNil(logger)) {
+      Logger.overrideLogger(logger);
+    }
+    if (bufferLogs) {
+      Logger.attachBuffer();
+    }
+    this.autoFlushLogs = autoFlushLogs ?? true;
   }
 
   private createHttpAdapter<T = any>(httpServer?: T): AbstractHttpAdapter {
@@ -225,15 +310,51 @@ export class NestFactoryStatic {
     );
   }
 
+  private setAbortOnError(
+    serverOrOptions?: AbstractHttpAdapter | NestApplicationOptions,
+    options?: NestApplicationContextOptions | NestApplicationOptions,
+  ) {
+    this.abortOnError = this.isHttpServer(serverOrOptions)
+      ? !(options && options.abortOnError === false)
+      : !(serverOrOptions && serverOrOptions.abortOnError === false);
+  }
+
   private createAdapterProxy<T>(app: NestApplication, adapter: HttpServer): T {
-    return (new Proxy(app, {
+    const proxy = new Proxy(app, {
       get: (receiver: Record<string, any>, prop: string) => {
+        const mapToProxy = (result: unknown) => {
+          return result instanceof Promise
+            ? result.then(mapToProxy)
+            : result instanceof NestApplication
+              ? proxy
+              : result;
+        };
+
         if (!(prop in receiver) && prop in adapter) {
-          return this.createExceptionZone(adapter, prop);
+          return (...args: unknown[]) => {
+            const result = this.createExceptionZone(adapter, prop)(...args);
+            return mapToProxy(result);
+          };
+        }
+        if (isFunction(receiver[prop])) {
+          return (...args: unknown[]) => {
+            const result = receiver[prop](...args);
+            return mapToProxy(result);
+          };
         }
         return receiver[prop];
       },
-    }) as unknown) as T;
+    });
+    return proxy as unknown as T;
+  }
+
+  private createGraphInspector(
+    appOptions: NestApplicationContextOptions,
+    container: NestContainer,
+  ) {
+    return appOptions?.snapshot
+      ? new GraphInspector(container)
+      : NoopGraphInspector;
   }
 }
 

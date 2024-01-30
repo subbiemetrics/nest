@@ -1,4 +1,9 @@
-import { INestApplication } from '@nestjs/common';
+import { INestApplication, HttpServer } from '@nestjs/common';
+import type { Server as CoreHttpServer } from 'http';
+import type { Server as CoreHttpsServer } from 'https';
+import type { Express } from 'express';
+import { NestExpressBodyParserOptions } from './nest-express-body-parser-options.interface';
+import { NestExpressBodyParserType } from './nest-express-body-parser.interface';
 import { ServeStaticOptions } from './serve-static-options.interface';
 
 /**
@@ -8,7 +13,31 @@ import { ServeStaticOptions } from './serve-static-options.interface';
  *
  * @publicApi
  */
-export interface NestExpressApplication extends INestApplication {
+export interface NestExpressApplication<
+  TServer extends CoreHttpServer | CoreHttpsServer = CoreHttpServer,
+> extends INestApplication<TServer> {
+  /**
+   * Returns the underlying HTTP adapter bounded to the Express.js app.
+   *
+   * @returns {HttpServer}
+   */
+  getHttpAdapter(): HttpServer<Express.Request, Express.Response, Express>;
+
+  /**
+   * Starts the application.
+   *
+   * @param {number|string} port
+   * @param {string} [hostname]
+   * @param {Function} [callback] Optional callback
+   * @returns {Promise} A Promise that, when resolved, is a reference to the underlying HttpServer.
+   */
+  listen(port: number | string, callback?: () => void): Promise<TServer>;
+  listen(
+    port: number | string,
+    hostname: string,
+    callback?: () => void,
+  ): Promise<TServer>;
+
   /**
    * A wrapper function around native `express.set()` method.
    *
@@ -58,6 +87,24 @@ export interface NestExpressApplication extends INestApplication {
   useStaticAssets(path: string, options?: ServeStaticOptions): this;
 
   /**
+   * Register Express body parsers on the fly. Will respect
+   * the application's `rawBody` option.
+   *
+   * @example
+   * const app = await NestFactory.create<NestExpressApplication>(
+   *   AppModule,
+   *   { rawBody: true }
+   * );
+   * app.useBodyParser('json', { limit: '50mb' });
+   *
+   * @returns {this}
+   */
+  useBodyParser<Options = NestExpressBodyParserOptions>(
+    parser: NestExpressBodyParserType,
+    options?: Omit<Options, 'verify'>,
+  ): this;
+
+  /**
    * Sets one or multiple base directories for templates (views).
    *
    * @example
@@ -75,4 +122,16 @@ export interface NestExpressApplication extends INestApplication {
    * @returns {this}
    */
   setViewEngine(engine: string): this;
+
+  /**
+   * Sets app-level globals for view templates.
+   *
+   * @example
+   * app.setLocal('title', 'My Site')
+   *
+   * @see https://expressjs.com/en/4x/api.html#app.locals
+   *
+   * @returns {this}
+   */
+  setLocal(key: string, value: any): this;
 }

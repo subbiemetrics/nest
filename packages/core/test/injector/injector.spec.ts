@@ -1,3 +1,5 @@
+import { Optional } from '@nestjs/common';
+import { PARAMTYPES_METADATA } from '@nestjs/common/constants';
 import * as chai from 'chai';
 import { expect } from 'chai';
 import * as chaiAsPromised from 'chai-as-promised';
@@ -9,6 +11,7 @@ import { NestContainer } from '../../injector/container';
 import { Injector, PropertyDependency } from '../../injector/injector';
 import { InstanceWrapper } from '../../injector/instance-wrapper';
 import { Module } from '../../injector/module';
+
 chai.use(chaiAsPromised);
 
 describe('Injector', () => {
@@ -29,7 +32,10 @@ describe('Injector', () => {
     class MainTest {
       @Inject() property: DependencyOne;
 
-      constructor(public one: DependencyOne, public two: DependencyTwo) {}
+      constructor(
+        public one: DependencyOne,
+        public two: DependencyTwo,
+      ) {}
     }
 
     let moduleDeps: Module;
@@ -39,25 +45,28 @@ describe('Injector', () => {
       moduleDeps = new Module(DependencyTwo, new NestContainer());
       mainTest = new InstanceWrapper({
         name: 'MainTest',
+        token: 'MainTest',
         metatype: MainTest,
         instance: Object.create(MainTest.prototype),
         isResolved: false,
       });
       depOne = new InstanceWrapper({
-        name: 'DependencyOne',
+        name: DependencyOne,
+        token: DependencyOne,
         metatype: DependencyOne,
         instance: Object.create(DependencyOne.prototype),
         isResolved: false,
       });
       depTwo = new InstanceWrapper({
-        name: 'DependencyTwo',
+        name: DependencyTwo,
+        token: DependencyTwo,
         metatype: DependencyTwo,
         instance: Object.create(DependencyOne.prototype),
         isResolved: false,
       });
       moduleDeps.providers.set('MainTest', mainTest);
-      moduleDeps.providers.set('DependencyOne', depOne);
-      moduleDeps.providers.set('DependencyTwo', depTwo);
+      moduleDeps.providers.set(DependencyOne, depOne);
+      moduleDeps.providers.set(DependencyTwo, depTwo);
       moduleDeps.providers.set('MainTestResolved', {
         ...mainTest,
         isResolved: true,
@@ -77,9 +86,9 @@ describe('Injector', () => {
 
     it('should set "isResolved" property to true after instance initialization', async () => {
       await injector.loadInstance(mainTest, moduleDeps.providers, moduleDeps);
-      const { isResolved } = (moduleDeps.providers.get(
-        'MainTest',
-      ) as InstanceWrapper<MainTest>).getInstanceByContextId(STATIC_CONTEXT);
+      const { isResolved } = (
+        moduleDeps.providers.get('MainTest') as InstanceWrapper<MainTest>
+      ).getInstanceByContextId(STATIC_CONTEXT);
       expect(isResolved).to.be.true;
     });
 
@@ -89,8 +98,7 @@ describe('Injector', () => {
       ).to.eventually.be.rejected;
     });
 
-    it('should await done$ when "isPending"', async () => {
-      const value = 'test';
+    it('should await done$ when "isPending"', () => {
       const wrapper = new InstanceWrapper({
         name: 'MainTest',
         metatype: MainTest,
@@ -98,19 +106,32 @@ describe('Injector', () => {
         isResolved: false,
       });
       const host = wrapper.getInstanceByContextId(STATIC_CONTEXT);
-      host.donePromise = Promise.resolve(value) as any;
+      host.donePromise = Promise.resolve();
       host.isPending = true;
 
-      const result = await injector.loadInstance(
-        wrapper,
-        moduleDeps.providers,
-        moduleDeps,
-      );
-      expect(result).to.be.eql(value);
+      expect(
+        injector.loadInstance(wrapper, moduleDeps.providers, moduleDeps),
+      ).to.eventually.not.throw();
+    });
+
+    it('should await done$ when "isPending" and rethrow an exception (if thrown)', () => {
+      const error = new Error('Test error');
+      const wrapper = new InstanceWrapper({
+        name: 'MainTest',
+        metatype: MainTest,
+        instance: Object.create(MainTest.prototype),
+        isResolved: false,
+      });
+      const host = wrapper.getInstanceByContextId(STATIC_CONTEXT);
+      host.donePromise = Promise.resolve(error);
+      host.isPending = true;
+
+      expect(
+        injector.loadInstance(wrapper, moduleDeps.providers, moduleDeps),
+      ).to.eventually.throw(error);
     });
 
     it('should return undefined when metatype is resolved', async () => {
-      const value = 'test';
       const result = await injector.loadInstance(
         new InstanceWrapper({
           name: 'MainTestResolved',
@@ -136,6 +157,7 @@ describe('Injector', () => {
       moduleDeps = new Module(Test, new NestContainer());
       test = new InstanceWrapper({
         name: 'Test',
+        token: 'Test',
         metatype: Test,
         instance: null,
         isResolved: false,
@@ -189,28 +211,28 @@ describe('Injector', () => {
   });
 
   describe('loadMiddleware', () => {
-    let resolveConstructorParams: sinon.SinonSpy;
+    let loadInstanceSpy: sinon.SinonSpy;
 
     beforeEach(() => {
-      resolveConstructorParams = sinon.spy();
-      injector.resolveConstructorParams = resolveConstructorParams;
+      loadInstanceSpy = sinon.spy();
+      injector.loadInstance = loadInstanceSpy;
     });
 
-    it('should call "resolveConstructorParams" when instance is not resolved', () => {
+    it('should call "loadInstance" when instance is not resolved', () => {
       const collection = {
         get: (...args) => ({}),
         set: (...args) => {},
       };
 
       injector.loadMiddleware(
-        { metatype: { name: '' } } as any,
+        { metatype: { name: '', prototype: {} } } as any,
         collection as any,
         null,
       );
-      expect(resolveConstructorParams.called).to.be.true;
+      expect(loadInstanceSpy.called).to.be.true;
     });
 
-    it('should not call "resolveConstructorParams" when instance is not resolved', () => {
+    it('should not call "loadInstanceSpy" when instance is not resolved', () => {
       const collection = {
         get: (...args) => ({
           instance: {},
@@ -223,7 +245,7 @@ describe('Injector', () => {
         collection as any,
         null,
       );
-      expect(resolveConstructorParams.called).to.be.false;
+      expect(loadInstanceSpy.called).to.be.false;
     });
   });
 
@@ -372,7 +394,7 @@ describe('Injector', () => {
     it('should return null when there is no related modules', async () => {
       const result = await injector.lookupComponentInImports(
         module as any,
-        null,
+        'testToken',
         new InstanceWrapper(),
       );
       expect(result).to.be.eq(null);
@@ -591,7 +613,7 @@ describe('Injector', () => {
       });
     });
 
-    describe('when instanceWraper has async property', () => {
+    describe('when instanceWrapper has async property', () => {
       it('should await instance', async () => {
         sinon.stub(injector, 'loadProvider').callsFake(() => null);
 
@@ -616,6 +638,7 @@ describe('Injector', () => {
       });
     });
   });
+
   describe('applyProperties', () => {
     describe('when instance is not an object', () => {
       it('should return undefined', () => {
@@ -690,17 +713,17 @@ describe('Injector', () => {
       const container = new NestContainer();
       const moduleCtor = class TestModule {};
       const ctx = STATIC_CONTEXT;
-      const module = await container.addModule(moduleCtor, []);
+      const { moduleRef } = await container.addModule(moduleCtor, []);
 
-      module.addProvider({
-        name: 'TestClass',
+      moduleRef.addProvider({
         provide: TestClass,
         useClass: TestClass,
       });
+
       const instance = await injector.loadPerContext(
         new TestClass(),
-        module,
-        module.providers,
+        moduleRef,
+        moduleRef.providers,
         ctx,
       );
       expect(instance).to.be.instanceOf(TestClass);
@@ -723,7 +746,7 @@ describe('Injector', () => {
 
       const loadInstanceStub = sinon
         .stub(injector, 'loadInstance')
-        .callsFake(async () => ({} as any));
+        .callsFake(async () => ({}) as any);
 
       await injector.loadEnhancersPerContext(wrapper, STATIC_CONTEXT);
       expect(loadInstanceStub.calledTwice).to.be.true;
@@ -797,6 +820,125 @@ describe('Injector', () => {
       );
       await injector.resolveProperties(wrapper, null, null, { id: 2 });
       expect(loadPropertiesMetadataSpy.called).to.be.true;
+    });
+  });
+
+  describe('getClassDependencies', () => {
+    it('should return an array that consists of deps and optional dep ids', async () => {
+      class FixtureDep1 {}
+      class FixtureDep2 {}
+
+      @Injectable()
+      class FixtureClass {
+        constructor(
+          private dep1: FixtureDep1,
+          @Optional() private dep2: FixtureDep2,
+        ) {}
+      }
+
+      const wrapper = new InstanceWrapper({ metatype: FixtureClass });
+      const [dependencies, optionalDependenciesIds] =
+        injector.getClassDependencies(wrapper);
+
+      expect(dependencies).to.deep.eq([FixtureDep1, FixtureDep2]);
+      expect(optionalDependenciesIds).to.deep.eq([1]);
+    });
+
+    it('should not mutate the constructor metadata', async () => {
+      class FixtureDep1 {}
+      /** This needs to be something other than FixtureDep1 so the test can ensure that the metadata was not mutated */
+      const injectionToken = 'test_token';
+
+      @Injectable()
+      class FixtureClass {
+        constructor(@Inject(injectionToken) private dep1: FixtureDep1) {}
+      }
+
+      const wrapper = new InstanceWrapper({ metatype: FixtureClass });
+      const [dependencies] = injector.getClassDependencies(wrapper);
+      expect(dependencies).to.deep.eq([injectionToken]);
+
+      const paramtypes = Reflect.getMetadata(PARAMTYPES_METADATA, FixtureClass);
+      expect(paramtypes).to.deep.eq([FixtureDep1]);
+    });
+  });
+
+  describe('getFactoryProviderDependencies', () => {
+    it('should return an array that consists of deps and optional dep ids', async () => {
+      class FixtureDep1 {}
+      class FixtureDep2 {}
+
+      const wrapper = new InstanceWrapper({
+        inject: [
+          FixtureDep1,
+          { token: FixtureDep2, optional: true },
+          { token: FixtureDep2, optional: false },
+          {} as any,
+        ],
+      });
+      const [dependencies, optionalDependenciesIds] =
+        injector.getFactoryProviderDependencies(wrapper);
+
+      expect(dependencies).to.deep.eq([
+        FixtureDep1,
+        FixtureDep2,
+        FixtureDep2,
+        {},
+      ]);
+      expect(optionalDependenciesIds).to.deep.eq([1]);
+    });
+  });
+
+  describe('addDependencyMetadata', () => {
+    interface IInjector extends Omit<Injector, 'addDependencyMetadata'> {
+      addDependencyMetadata: (
+        keyOrIndex: symbol | string | number,
+        hostWrapper: InstanceWrapper,
+        instanceWrapper: InstanceWrapper,
+      ) => void;
+    }
+
+    let exposedInjector: IInjector;
+    let hostWrapper: InstanceWrapper;
+    let instanceWrapper: InstanceWrapper;
+
+    beforeEach(() => {
+      exposedInjector = injector as unknown as IInjector;
+      hostWrapper = new InstanceWrapper();
+      instanceWrapper = new InstanceWrapper();
+    });
+
+    it('should add dependency metadata to PropertiesMetadata when key is symbol', async () => {
+      const addPropertiesMetadataSpy = sinon.spy(
+        hostWrapper,
+        'addPropertiesMetadata',
+      );
+
+      const key = Symbol.for('symbol');
+      exposedInjector.addDependencyMetadata(key, hostWrapper, instanceWrapper);
+
+      expect(addPropertiesMetadataSpy.called).to.be.true;
+    });
+
+    it('should add dependency metadata to PropertiesMetadata when key is string', async () => {
+      const addPropertiesMetadataSpy = sinon.spy(
+        hostWrapper,
+        'addPropertiesMetadata',
+      );
+
+      const key = 'string';
+      exposedInjector.addDependencyMetadata(key, hostWrapper, instanceWrapper);
+
+      expect(addPropertiesMetadataSpy.called).to.be.true;
+    });
+
+    it('should add dependency metadata to CtorMetadata when key is number', async () => {
+      const addCtorMetadataSpy = sinon.spy(hostWrapper, 'addCtorMetadata');
+
+      const key = 0;
+      exposedInjector.addDependencyMetadata(key, hostWrapper, instanceWrapper);
+
+      expect(addCtorMetadataSpy.called).to.be.true;
     });
   });
 });

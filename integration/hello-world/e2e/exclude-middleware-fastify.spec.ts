@@ -13,7 +13,7 @@ import {
 } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
 import * as request from 'supertest';
-import { ApplicationModule } from '../src/app.module';
+import { AppModule } from '../src/app.module';
 
 const RETURN_VALUE = 'test';
 const MIDDLEWARE_VALUE = 'middleware';
@@ -22,6 +22,11 @@ const MIDDLEWARE_VALUE = 'middleware';
 class TestController {
   @Get('test')
   test() {
+    return RETURN_VALUE;
+  }
+
+  @Get('test/test')
+  testTest() {
     return RETURN_VALUE;
   }
 
@@ -52,7 +57,7 @@ class TestController {
 }
 
 @Module({
-  imports: [ApplicationModule],
+  imports: [AppModule],
   controllers: [TestController],
 })
 class TestModule {
@@ -83,6 +88,12 @@ describe('Exclude middleware (fastify)', () => {
 
   it(`should exclude "/test" endpoint`, () => {
     return request(app.getHttpServer()).get('/test').expect(200, RETURN_VALUE);
+  });
+
+  it(`should not exclude "/test/test" endpoint`, () => {
+    return request(app.getHttpServer())
+      .get('/test/test')
+      .expect(200, MIDDLEWARE_VALUE);
   });
 
   it(`should not exclude "/test2" endpoint`, () => {

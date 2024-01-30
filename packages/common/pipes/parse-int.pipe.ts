@@ -1,13 +1,23 @@
-import { ArgumentMetadata, HttpStatus, Injectable, Optional } from '../index';
-import { PipeTransform } from '../interfaces/features/pipe-transform.interface';
+import { Injectable } from '../decorators/core/injectable.decorator';
+import { Optional } from '../decorators/core/optional.decorator';
+import { HttpStatus } from '../enums/http-status.enum';
+import {
+  ArgumentMetadata,
+  PipeTransform,
+} from '../interfaces/features/pipe-transform.interface';
 import {
   ErrorHttpStatusCode,
   HttpErrorByCode,
 } from '../utils/http-error-by-code.util';
+import { isNil } from '../utils/shared.utils';
 
+/**
+ * @publicApi
+ */
 export interface ParseIntPipeOptions {
   errorHttpStatusCode?: ErrorHttpStatusCode;
   exceptionFactory?: (error: string) => any;
+  optional?: boolean;
 }
 
 /**
@@ -21,12 +31,10 @@ export interface ParseIntPipeOptions {
 export class ParseIntPipe implements PipeTransform<string> {
   protected exceptionFactory: (error: string) => any;
 
-  constructor(@Optional() options?: ParseIntPipeOptions) {
+  constructor(@Optional() protected readonly options?: ParseIntPipeOptions) {
     options = options || {};
-    const {
-      exceptionFactory,
-      errorHttpStatusCode = HttpStatus.BAD_REQUEST,
-    } = options;
+    const { exceptionFactory, errorHttpStatusCode = HttpStatus.BAD_REQUEST } =
+      options;
 
     this.exceptionFactory =
       exceptionFactory ||
@@ -41,15 +49,26 @@ export class ParseIntPipe implements PipeTransform<string> {
    * @param metadata contains metadata about the currently processed route argument
    */
   async transform(value: string, metadata: ArgumentMetadata): Promise<number> {
-    const isNumeric =
-      ['string', 'number'].includes(typeof value) &&
-      !isNaN(parseFloat(value)) &&
-      isFinite(value as any);
-    if (!isNumeric) {
+    if (isNil(value) && this.options?.optional) {
+      return value;
+    }
+    if (!this.isNumeric(value)) {
       throw this.exceptionFactory(
         'Validation failed (numeric string is expected)',
       );
     }
     return parseInt(value, 10);
+  }
+
+  /**
+   * @param value currently processed route argument
+   * @returns `true` if `value` is a valid integer number
+   */
+  protected isNumeric(value: string): boolean {
+    return (
+      ['string', 'number'].includes(typeof value) &&
+      /^-?\d+$/.test(value) &&
+      isFinite(value as any)
+    );
   }
 }

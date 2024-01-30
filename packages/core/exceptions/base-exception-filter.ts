@@ -11,7 +11,7 @@ import {
 import { isObject } from '@nestjs/common/utils/shared.utils';
 import { AbstractHttpAdapter } from '../adapters';
 import { MESSAGES } from '../constants';
-import { HttpAdapterHost } from '../helpers';
+import { HttpAdapterHost } from '../helpers/http-adapter-host';
 
 export class BaseExceptionFilter<T = any> implements ExceptionFilter<T> {
   private static readonly logger = new Logger('ExceptionsHandler');
@@ -38,7 +38,12 @@ export class BaseExceptionFilter<T = any> implements ExceptionFilter<T> {
           message: res,
         };
 
-    applicationRef.reply(host.getArgByIndex(1), message, exception.getStatus());
+    const response = host.getArgByIndex(1);
+    if (!applicationRef.isHeadersSent(response)) {
+      applicationRef.reply(response, message, exception.getStatus());
+    } else {
+      applicationRef.end(response);
+    }
   }
 
   public handleUnknownError(
@@ -46,11 +51,23 @@ export class BaseExceptionFilter<T = any> implements ExceptionFilter<T> {
     host: ArgumentsHost,
     applicationRef: AbstractHttpAdapter | HttpServer,
   ) {
-    const body = {
-      statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-      message: MESSAGES.UNKNOWN_EXCEPTION_MESSAGE,
-    };
-    applicationRef.reply(host.getArgByIndex(1), body, body.statusCode);
+    const body = this.isHttpError(exception)
+      ? {
+          statusCode: exception.statusCode,
+          message: exception.message,
+        }
+      : {
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+          message: MESSAGES.UNKNOWN_EXCEPTION_MESSAGE,
+        };
+
+    const response = host.getArgByIndex(1);
+    if (!applicationRef.isHeadersSent(response)) {
+      applicationRef.reply(response, body, body.statusCode);
+    } else {
+      applicationRef.end(response);
+    }
+
     if (this.isExceptionObject(exception)) {
       return BaseExceptionFilter.logger.error(
         exception.message,
@@ -62,5 +79,13 @@ export class BaseExceptionFilter<T = any> implements ExceptionFilter<T> {
 
   public isExceptionObject(err: any): err is Error {
     return isObject(err) && !!(err as Error).message;
+  }
+
+  /**
+   * Checks if the thrown error comes from the "http-errors" library.
+   * @param err error object
+   */
+  public isHttpError(err: any): err is { statusCode: number; message: string } {
+    return err?.statusCode && err?.message;
   }
 }

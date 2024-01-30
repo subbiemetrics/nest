@@ -7,25 +7,32 @@ import {
   RequestMethod,
 } from '@nestjs/common';
 import {
-  CUSTOM_ROUTE_AGRS_METADATA,
+  CUSTOM_ROUTE_ARGS_METADATA,
   HEADERS_METADATA,
   HTTP_CODE_METADATA,
   REDIRECT_METADATA,
   RENDER_METADATA,
   ROUTE_ARGS_METADATA,
+  SSE_METADATA,
 } from '@nestjs/common/constants';
 import { RouteParamMetadata } from '@nestjs/common/decorators';
 import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
 import { ContextType, Controller } from '@nestjs/common/interfaces';
 import { isEmpty, isString } from '@nestjs/common/utils/shared.utils';
-import { FORBIDDEN_MESSAGE } from '../guards/constants';
-import { GuardsConsumer } from '../guards/guards-consumer';
-import { GuardsContextCreator } from '../guards/guards-context-creator';
+import { IncomingMessage } from 'http';
+import { Observable } from 'rxjs';
+import {
+  FORBIDDEN_MESSAGE,
+  GuardsConsumer,
+  GuardsContextCreator,
+} from '../guards';
 import { ContextUtils } from '../helpers/context-utils';
 import { ExecutionContextHost } from '../helpers/execution-context-host';
 import {
+  HandleResponseFn,
   HandlerMetadata,
   HandlerMetadataStorage,
+  HandlerResponseBasicFn,
 } from '../helpers/handler-metadata-storage';
 import { STATIC_CONTEXT } from '../injector/constants';
 import { InterceptorsConsumer } from '../interceptors/interceptors-consumer';
@@ -38,6 +45,7 @@ import {
   RedirectResponse,
   RouterResponseController,
 } from './router-response-controller';
+import { HeaderStream } from './sse-stream';
 
 export interface ParamProperties {
   index: number;
@@ -130,15 +138,17 @@ export class RouterExecutionContext {
     );
     const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
 
-    const handler = <TRequest, TResponse>(
-      args: any[],
-      req: TRequest,
-      res: TResponse,
-      next: Function,
-    ) => async () => {
-      fnApplyPipes && (await fnApplyPipes(args, req, res, next));
-      return callback.apply(instance, args);
-    };
+    const handler =
+      <TRequest, TResponse>(
+        args: any[],
+        req: TRequest,
+        res: TResponse,
+        next: Function,
+      ) =>
+      async () => {
+        fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+        return callback.apply(instance, args);
+      };
 
     return async <TRequest, TResponse>(
       req: TRequest,
@@ -160,7 +170,7 @@ export class RouterExecutionContext {
         handler(args, req, res, next),
         contextType,
       );
-      await fnHandleResponse(result, res);
+      await (fnHandleResponse as HandlerResponseBasicFn)(result, res, req);
     };
   }
 
@@ -209,9 +219,10 @@ export class RouterExecutionContext {
       );
 
     const paramsMetadata = getParamsMetadata(moduleKey);
-    const isResponseHandled = paramsMetadata.some(
-      ({ type }) =>
-        type === RouteParamtypes.RESPONSE || type === RouteParamtypes.NEXT,
+    const isResponseHandled = this.isResponseHandled(
+      instance,
+      methodName,
+      paramsMetadata,
     );
 
     const httpRedirectResponse = this.reflectRedirect(callback);
@@ -265,6 +276,10 @@ export class RouterExecutionContext {
     return Reflect.getMetadata(HEADERS_METADATA, callback) || [];
   }
 
+  public reflectSse(callback: (...args: unknown[]) => unknown): string {
+    return Reflect.getMetadata(SSE_METADATA, callback);
+  }
+
   public exchangeKeysForValues(
     keys: string[],
     metadata: Record<number, RouteParamMetadata>,
@@ -284,7 +299,7 @@ export class RouterExecutionContext {
       );
       const type = this.contextUtils.mapParamType(key);
 
-      if (key.includes(CUSTOM_ROUTE_AGRS_METADATA)) {
+      if (key.includes(CUSTOM_ROUTE_ARGS_METADATA)) {
         const { factory } = metadata[key];
         const customExtractValue = this.contextUtils.getCustomFactory(
           factory,
@@ -332,6 +347,8 @@ export class RouterExecutionContext {
       type === RouteParamtypes.BODY ||
       type === RouteParamtypes.QUERY ||
       type === RouteParamtypes.PARAM ||
+      type === RouteParamtypes.FILE ||
+      type === RouteParamtypes.FILES ||
       isString(type)
     );
   }
@@ -398,22 +415,62 @@ export class RouterExecutionContext {
     isResponseHandled: boolean,
     redirectResponse?: RedirectResponse,
     httpStatusCode?: number,
-  ) {
+  ): HandleResponseFn {
     const renderTemplate = this.reflectRenderTemplate(callback);
     if (renderTemplate) {
       return async <TResult, TResponse>(result: TResult, res: TResponse) => {
-        await this.responseController.render(result, res, renderTemplate);
+        return await this.responseController.render(
+          result,
+          res,
+          renderTemplate,
+        );
       };
     }
-    if (redirectResponse && typeof redirectResponse.url === 'string') {
+    if (redirectResponse && isString(redirectResponse.url)) {
       return async <TResult, TResponse>(result: TResult, res: TResponse) => {
         await this.responseController.redirect(result, res, redirectResponse);
+      };
+    }
+    const isSseHandler = !!this.reflectSse(callback);
+    if (isSseHandler) {
+      return <
+        TResult extends Observable<unknown> = any,
+        TResponse extends HeaderStream = any,
+        TRequest extends IncomingMessage = any,
+      >(
+        result: TResult,
+        res: TResponse,
+        req: TRequest,
+      ) => {
+        this.responseController.sse(
+          result,
+          (res as any).raw || res,
+          (req as any).raw || req,
+          { additionalHeaders: res.getHeaders?.() },
+        );
       };
     }
     return async <TResult, TResponse>(result: TResult, res: TResponse) => {
       result = await this.responseController.transformToResult(result);
       !isResponseHandled &&
         (await this.responseController.apply(result, res, httpStatusCode));
+      return res;
     };
+  }
+
+  private isResponseHandled(
+    instance: Controller,
+    methodName: string,
+    paramsMetadata: ParamProperties[],
+  ): boolean {
+    const hasResponseOrNextDecorator = paramsMetadata.some(
+      ({ type }) =>
+        type === RouteParamtypes.RESPONSE || type === RouteParamtypes.NEXT,
+    );
+    const isPassthroughEnabled = this.contextUtils.reflectPassthrough(
+      instance,
+      methodName,
+    );
+    return hasResponseOrNextDecorator && !isPassthroughEnabled;
   }
 }

@@ -7,14 +7,20 @@ import {
   Post,
 } from '../../../common/decorators/http/request-mapping.decorator';
 import { RequestMethod } from '../../../common/enums/request-method.enum';
+import { VersioningType } from '../../../common/enums/version-type.enum';
 import { Injector } from '../../../core/injector/injector';
 import { ApplicationConfig } from '../../application-config';
+import { UnknownRequestMappingException } from '../../errors/exceptions/unknown-request-mapping.exception';
 import { ExecutionContextHost } from '../../helpers/execution-context-host';
 import { NestContainer } from '../../injector/container';
 import { InstanceWrapper } from '../../injector/instance-wrapper';
+import { GraphInspector } from '../../inspector/graph-inspector';
 import { MetadataScanner } from '../../metadata-scanner';
+import { RoutePathMetadata } from '../../router/interfaces/route-path-metadata.interface';
+import { RoutePathFactory } from '../../router/route-path-factory';
 import { RouterExceptionFilters } from '../../router/router-exception-filters';
 import { RouterExplorer } from '../../router/router-explorer';
+import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
 
 describe('RouterExplorer', () => {
   @Controller('global')
@@ -32,17 +38,40 @@ describe('RouterExplorer', () => {
     public getTestUsingArray() {}
   }
 
+  @Controller(['global', 'global-alias'])
+  class TestRouteAlias {
+    @Get('test')
+    public getTest() {}
+
+    @Post('test')
+    public postTest() {}
+
+    @All('another-test')
+    public anotherTest() {}
+
+    @Get(['foo', 'bar'])
+    public getTestUsingArray() {}
+  }
+
+  class ClassWithMissingControllerDecorator {}
+
   let routerBuilder: RouterExplorer;
   let injector: Injector;
   let exceptionsFilter: RouterExceptionFilters;
+  let applicationConfig: ApplicationConfig;
+  let routePathFactory: RoutePathFactory;
+  let graphInspector: GraphInspector;
 
   beforeEach(() => {
     const container = new NestContainer();
 
+    applicationConfig = new ApplicationConfig();
     injector = new Injector();
+    routePathFactory = new RoutePathFactory(applicationConfig);
+    graphInspector = new GraphInspector(container);
     exceptionsFilter = new RouterExceptionFilters(
       container,
-      new ApplicationConfig(),
+      applicationConfig,
       null,
     );
     routerBuilder = new RouterExplorer(
@@ -51,55 +80,10 @@ describe('RouterExplorer', () => {
       injector,
       null,
       exceptionsFilter,
+      applicationConfig,
+      routePathFactory,
+      graphInspector,
     );
-  });
-
-  describe('scanForPaths', () => {
-    it('should method return expected list of route paths', () => {
-      const paths = routerBuilder.scanForPaths(new TestRoute());
-
-      expect(paths).to.have.length(4);
-
-      expect(paths[0].path).to.eql(['/test']);
-      expect(paths[1].path).to.eql(['/test']);
-      expect(paths[2].path).to.eql(['/another-test']);
-      expect(paths[3].path).to.eql(['/foo', '/bar']);
-
-      expect(paths[0].requestMethod).to.eql(RequestMethod.GET);
-      expect(paths[1].requestMethod).to.eql(RequestMethod.POST);
-      expect(paths[2].requestMethod).to.eql(RequestMethod.ALL);
-      expect(paths[3].requestMethod).to.eql(RequestMethod.GET);
-    });
-  });
-
-  describe('exploreMethodMetadata', () => {
-    it('should method return expected object which represent single route', () => {
-      const instance = new TestRoute();
-      const instanceProto = Object.getPrototypeOf(instance);
-
-      const route = routerBuilder.exploreMethodMetadata(
-        new TestRoute(),
-        instanceProto,
-        'getTest',
-      );
-
-      expect(route.path).to.eql(['/test']);
-      expect(route.requestMethod).to.eql(RequestMethod.GET);
-    });
-
-    it('should method return expected object which represent multiple routes', () => {
-      const instance = new TestRoute();
-      const instanceProto = Object.getPrototypeOf(instance);
-
-      const route = routerBuilder.exploreMethodMetadata(
-        new TestRoute(),
-        instanceProto,
-        'getTestUsingArray',
-      );
-
-      expect(route.path).to.eql(['/foo', '/bar']);
-      expect(route.requestMethod).to.eql(RequestMethod.GET);
-    });
   });
 
   describe('applyPathsToRouterProxy', () => {
@@ -119,25 +103,63 @@ describe('RouterExplorer', () => {
         paths as any,
         null,
         '',
-        '',
+        {},
         '',
       );
 
       expect(bindStub.calledWith(null, paths[0], null)).to.be.true;
       expect(bindStub.callCount).to.be.eql(paths.length);
     });
+
+    it('should method return expected object which represents a single versioned route', () => {
+      const bindStub = sinon.stub(
+        routerBuilder,
+        'applyCallbackToRouter' as any,
+      );
+      const paths = [
+        { path: [''], requestMethod: RequestMethod.GET },
+        { path: ['test'], requestMethod: RequestMethod.GET },
+        { path: ['foo', 'bar'], requestMethod: RequestMethod.GET },
+      ];
+
+      const routePathMetadata: RoutePathMetadata = {
+        versioningOptions: { type: VersioningType.URI },
+      };
+      routerBuilder.applyPathsToRouterProxy(
+        null,
+        paths as any,
+        null,
+        '',
+        routePathMetadata,
+        '1',
+      );
+
+      expect(
+        bindStub.calledWith(null, paths[0], null, '', routePathMetadata, '1'),
+      ).to.be.true;
+      expect(bindStub.callCount).to.be.eql(paths.length);
+    });
   });
 
   describe('extractRouterPath', () => {
     it('should return expected path', () => {
-      expect(routerBuilder.extractRouterPath(TestRoute)).to.be.eql('/global');
-      expect(routerBuilder.extractRouterPath(TestRoute, '/module')).to.be.eql(
-        '/module/global',
-      );
+      expect(routerBuilder.extractRouterPath(TestRoute)).to.be.eql(['/global']);
     });
 
-    it('should throw it a there is a bad path expected path', () => {
-      expect(() => routerBuilder.validateRoutePath(undefined)).to.throw();
+    it('should return expected path with alias', () => {
+      expect(routerBuilder.extractRouterPath(TestRouteAlias)).to.be.eql([
+        '/global',
+        '/global-alias',
+      ]);
+    });
+
+    it("should throw UnknownRequestMappingException when missing the `@Controller()` decorator in the class, displaying class's name", () => {
+      expect(() =>
+        routerBuilder.extractRouterPath(ClassWithMissingControllerDecorator),
+      ).to.throw(
+        UnknownRequestMappingException,
+        /ClassWithMissingControllerDecorator/,
+      );
     });
   });
 
@@ -153,7 +175,7 @@ describe('RouterExplorer', () => {
         () =>
           ({
             next: nextSpy,
-          } as any),
+          }) as any,
       );
     });
 
@@ -167,7 +189,7 @@ describe('RouterExplorer', () => {
         instance: { [methodKey]: {} },
       });
 
-      it('should delegete error to exception filters', async () => {
+      it('should delegate error to exception filters', async () => {
         const handler = routerBuilder.createRequestScopedHandler(
           wrapper,
           RequestMethod.ALL,
@@ -183,6 +205,61 @@ describe('RouterExplorer', () => {
           ExecutionContextHost,
         );
       });
+    });
+  });
+
+  describe('applyVersionFilter', () => {
+    it('should call and return the `applyVersionFilter` from the underlying http server', () => {
+      const router = sinon.spy(new NoopHttpAdapter({}));
+      const routePathMetadata: RoutePathMetadata = {
+        methodVersion:
+          sinon.fake() as unknown as RoutePathMetadata['methodVersion'],
+        versioningOptions:
+          sinon.fake() as unknown as RoutePathMetadata['versioningOptions'],
+      };
+      const handler = sinon.stub();
+
+      // We're using type assertion here because `applyVersionFilter` is private
+      const versionFilter = (routerBuilder as any).applyVersionFilter(
+        router,
+        routePathMetadata,
+        handler,
+      );
+
+      expect(
+        router.applyVersionFilter.calledOnceWithExactly(
+          handler,
+          routePathMetadata.methodVersion,
+          routePathMetadata.versioningOptions,
+        ),
+      ).to.be.true;
+
+      expect(router.applyVersionFilter.returnValues[0]).to.be.equal(
+        versionFilter,
+      );
+    });
+  });
+
+  describe('copyMetadataToCallback', () => {
+    it('should then copy the metadata from the original callback to the target callback', () => {
+      const originalCallback = () => {};
+      Reflect.defineMetadata(
+        'test_metadata_key',
+        'test_metadata_value',
+        originalCallback,
+      );
+
+      const targetCallback = () => {};
+
+      // We're using type assertion here because `copyMetadataToCallback` is private
+      (routerBuilder as any).copyMetadataToCallback(
+        originalCallback,
+        targetCallback,
+      );
+
+      expect(
+        Reflect.getMetadata('test_metadata_key', targetCallback),
+      ).to.be.equal('test_metadata_value');
     });
   });
 });

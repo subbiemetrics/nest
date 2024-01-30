@@ -1,14 +1,23 @@
+import { Type } from '@nestjs/common';
+import { ConnectionOptions } from 'tls';
 import { Transport } from '../enums/transport.enum';
 import { ChannelOptions } from '../external/grpc-options.interface';
 import {
-  CompressionTypes,
   ConsumerConfig,
+  ConsumerRunConfig,
+  ConsumerSubscribeTopics,
   KafkaConfig,
   ProducerConfig,
-} from '../external/kafka-options.interface';
-import { MqttClientOptions } from '../external/mqtt-options.interface';
-import { ClientOpts } from '../external/redis.interface';
-import { Server } from '../server/server';
+  ProducerRecord,
+} from '../external/kafka.interface';
+import { MqttClientOptions, QoS } from '../external/mqtt-options.interface';
+import { IORedisOptions } from '../external/redis.interface';
+import {
+  AmqpConnectionManagerSocketOptions,
+  AmqplibQueueOptions,
+  RmqUrl,
+} from '../external/rmq-url.interface';
+import { TcpSocket } from '../helpers';
 import { CustomTransportStrategy } from './custom-transport-strategy.interface';
 import { Deserializer } from './deserializer.interface';
 import { Serializer } from './serializer.interface';
@@ -23,11 +32,17 @@ export type MicroserviceOptions =
   | KafkaOptions
   | CustomStrategy;
 
+/**
+ * @publicApi
+ */
 export interface CustomStrategy {
-  strategy: Server & CustomTransportStrategy;
+  strategy: CustomTransportStrategy;
   options?: {};
 }
 
+/**
+ * @publicApi
+ */
 export interface GrpcOptions {
   transport?: Transport.GRPC;
   options: {
@@ -46,9 +61,11 @@ export interface GrpcOptions {
     };
     channelOptions?: ChannelOptions;
     credentials?: any;
-    protoPath: string | string[];
+    protoPath?: string | string[];
     package: string | string[];
     protoLoader?: string;
+    packageDefinition?: any;
+    gracefulShutdown?: boolean;
     loader?: {
       keepCase?: boolean;
       alternateCommentMode?: boolean;
@@ -65,6 +82,9 @@ export interface GrpcOptions {
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface TcpOptions {
   transport?: Transport.TCP;
   options?: {
@@ -73,87 +93,165 @@ export interface TcpOptions {
     retryAttempts?: number;
     retryDelay?: number;
     serializer?: Serializer;
+    tlsOptions?: ConnectionOptions;
     deserializer?: Deserializer;
+    socketClass?: Type<TcpSocket>;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface RedisOptions {
   transport?: Transport.REDIS;
   options?: {
-    url?: string;
+    host?: string;
+    port?: number;
     retryAttempts?: number;
     retryDelay?: number;
+    /**
+     * Use `psubscribe`/`pmessage` to enable wildcards in the patterns
+     */
+    wildcards?: boolean;
     serializer?: Serializer;
     deserializer?: Deserializer;
-  } & ClientOpts;
+  } & IORedisOptions;
 }
 
+/**
+ * @publicApi
+ */
 export interface MqttOptions {
   transport?: Transport.MQTT;
   options?: MqttClientOptions & {
     url?: string;
     serializer?: Serializer;
     deserializer?: Deserializer;
+    subscribeOptions?: {
+      /**
+       * The QoS
+       */
+      qos: QoS;
+      /*
+       * No local flag
+       * */
+      nl?: boolean;
+      /*
+       * Retain as Published flag
+       * */
+      rap?: boolean;
+      /*
+       * Retain Handling option
+       * */
+      rh?: number;
+    };
+    userProperties?: Record<string, string | string[]>;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface NatsOptions {
   transport?: Transport.NATS;
   options?: {
-    url?: string;
+    headers?: Record<string, string>;
+    authenticator?: any;
+    debug?: boolean;
+    ignoreClusterUpdates?: boolean;
+    inboxPrefix?: string;
+    encoding?: string;
     name?: string;
     user?: string;
     pass?: string;
+    maxPingOut?: number;
     maxReconnectAttempts?: number;
     reconnectTimeWait?: number;
-    servers?: string[];
+    reconnectJitter?: number;
+    reconnectJitterTLS?: number;
+    reconnectDelayHandler?: any;
+    servers?: string[] | string;
+    nkey?: any;
     reconnect?: boolean;
     pedantic?: boolean;
     tls?: any;
     queue?: string;
     serializer?: Serializer;
     deserializer?: Deserializer;
+    userJWT?: string;
+    nonceSigner?: any;
+    userCreds?: any;
+    useOldRequestStyle?: boolean;
+    pingInterval?: number;
+    preserveBuffers?: boolean;
+    waitOnFirstConnect?: boolean;
+    verbose?: boolean;
+    noEcho?: boolean;
+    noRandomize?: boolean;
+    timeout?: number;
+    token?: string;
+    yieldTime?: number;
+    tokenHandler?: any;
+    [key: string]: any;
   };
 }
 
+/**
+ * @publicApi
+ */
 export interface RmqOptions {
   transport?: Transport.RMQ;
   options?: {
-    urls?: string[];
+    urls?: string[] | RmqUrl[];
     queue?: string;
     prefetchCount?: number;
     isGlobalPrefetchCount?: boolean;
-    queueOptions?: any;
-    socketOptions?: any;
+    queueOptions?: AmqplibQueueOptions;
+    socketOptions?: AmqpConnectionManagerSocketOptions;
     noAck?: boolean;
+    consumerTag?: string;
     serializer?: Serializer;
     deserializer?: Deserializer;
     replyQueue?: string;
+    persistent?: boolean;
+    headers?: Record<string, string>;
+    noAssert?: boolean;
+    /**
+     * Maximum number of connection attempts.
+     * Applies only to the consumer configuration.
+     * -1 === infinite
+     * @default -1
+     */
+    maxConnectionAttempts?: number;
   };
 }
 
+/**
+ * @publicApi
+ */
+export interface KafkaParserConfig {
+  keepBinary?: boolean;
+}
+
+/**
+ * @publicApi
+ */
 export interface KafkaOptions {
   transport?: Transport.KAFKA;
   options?: {
+    /**
+     * Defaults to `"-server"` on server side and `"-client"` on client side.
+     */
+    postfixId?: string;
     client?: KafkaConfig;
     consumer?: ConsumerConfig;
-    run?: {
-      autoCommit?: boolean;
-      autoCommitInterval?: number | null;
-      autoCommitThreshold?: number | null;
-      eachBatchAutoResolve?: boolean;
-      partitionsConsumedConcurrently?: number;
-    };
-    subscribe?: {
-      fromBeginning?: boolean;
-    };
+    run?: Omit<ConsumerRunConfig, 'eachBatch' | 'eachMessage'>;
+    subscribe?: Omit<ConsumerSubscribeTopics, 'topics'>;
     producer?: ProducerConfig;
-    send?: {
-      acks?: number;
-      timeout?: number;
-      compression?: CompressionTypes;
-    };
+    send?: Omit<ProducerRecord, 'topic' | 'messages'>;
     serializer?: Serializer;
     deserializer?: Deserializer;
+    parser?: KafkaParserConfig;
+    producerOnlyMode?: boolean;
   };
 }

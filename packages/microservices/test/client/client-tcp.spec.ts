@@ -1,5 +1,7 @@
 import { expect } from 'chai';
+import { Socket as NetSocket } from 'net';
 import * as sinon from 'sinon';
+import { TLSSocket } from 'tls';
 import { ClientTCP } from '../../client/client-tcp';
 import { ERROR_EVENT } from '../../constants';
 
@@ -65,10 +67,10 @@ describe('ClientTCP', () => {
     const id = '1';
 
     describe('when disposed', () => {
-      beforeEach(() => {
+      beforeEach(async () => {
         callback = sinon.spy();
         client['routingMap'].set(id, callback);
-        client.handleResponse({ id, isDisposed: true });
+        await client.handleResponse({ id, isDisposed: true });
       });
       it('should emit disposed callback', () => {
         expect(callback.called).to.be.true;
@@ -83,11 +85,11 @@ describe('ClientTCP', () => {
     });
     describe('when not disposed', () => {
       let buffer;
-      beforeEach(() => {
+      beforeEach(async () => {
         buffer = { id, err: undefined, response: 'res' };
         callback = sinon.spy();
         client['routingMap'].set(id, callback);
-        client.handleResponse(buffer);
+        await client.handleResponse(buffer);
       });
       it('should not end server', () => {
         expect(socket.end.called).to.be.false;
@@ -117,8 +119,7 @@ describe('ClientTCP', () => {
       beforeEach(async () => {
         client['isConnected'] = false;
         const source = {
-          subscribe: resolve => resolve(),
-          toPromise: () => source,
+          subscribe: ({ complete }) => complete(),
           pipe: () => source,
         };
         connect$Stub = sinon
@@ -155,9 +156,16 @@ describe('ClientTCP', () => {
     });
   });
   describe('close', () => {
+    let routingMap;
+    let callback;
+
     beforeEach(() => {
+      routingMap = new Map<string, Function>();
+      callback = sinon.spy();
+      routingMap.set('some id', callback);
       (client as any).socket = socket;
       (client as any).isConnected = true;
+      (client as any).routingMap = routingMap;
       client.close();
     });
     it('should end() socket', () => {
@@ -168,6 +176,16 @@ describe('ClientTCP', () => {
     });
     it('should set "socket" to null', () => {
       expect((client as any).socket).to.be.null;
+    });
+    it('should clear out the routing map', () => {
+      expect((client as any).routingMap.size).to.be.eq(0);
+    });
+    it('should call callbacks', () => {
+      expect(
+        callback.calledWith({
+          err: sinon.match({ message: 'Connection closed' }),
+        }),
+      ).to.be.true;
     });
   });
   describe('bindEvents', () => {
@@ -196,6 +214,18 @@ describe('ClientTCP', () => {
       await client['dispatchEvent'](msg);
 
       expect(sendMessageStub.called).to.be.true;
+    });
+  });
+
+  describe('tls', () => {
+    it('should upgrade to TLS', () => {
+      const client = new ClientTCP({ tlsOptions: {} });
+      const jsonSocket = client.createSocket();
+      expect(jsonSocket.socket).instanceOf(TLSSocket);
+    });
+    it('should not upgrade to TLS, if not requested', () => {
+      const jsonSocket = new ClientTCP({}).createSocket();
+      expect(jsonSocket.socket).instanceOf(NetSocket);
     });
   });
 });

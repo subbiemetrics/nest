@@ -3,12 +3,18 @@ import {
   isString,
   isUndefined,
 } from '@nestjs/common/utils/shared.utils';
-import { EMPTY, fromEvent, Subject } from 'rxjs';
+import {
+  EMPTY,
+  Observable,
+  Subject,
+  Subscription,
+  defaultIfEmpty,
+  fromEvent,
+  lastValueFrom,
+} from 'rxjs';
 import { catchError, takeUntil } from 'rxjs/operators';
 import {
   CANCEL_EVENT,
-  GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-  GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
   GRPC_DEFAULT_PROTO_LOADER,
   GRPC_DEFAULT_URL,
 } from '../constants';
@@ -16,6 +22,8 @@ import { GrpcMethodStreamingType } from '../decorators';
 import { Transport } from '../enums';
 import { InvalidGrpcPackageException } from '../errors/invalid-grpc-package.exception';
 import { InvalidProtoDefinitionException } from '../errors/invalid-proto-definition.exception';
+import { ChannelOptions } from '../external/grpc-options.interface';
+import { getGrpcPackageDefinition } from '../helpers';
 import { CustomTransportStrategy, MessageHandler } from '../interfaces';
 import { GrpcOptions } from '../interfaces/microservice-configuration.interface';
 import { Server } from './server';
@@ -26,9 +34,11 @@ let grpcProtoLoaderPackage: any = {};
 interface GrpcCall<TRequest = any, TMetadata = any> {
   request: TRequest;
   metadata: TMetadata;
+  sendMetadata: Function;
   end: Function;
   write: Function;
   on: Function;
+  off: Function;
   emit: Function;
 }
 
@@ -45,15 +55,28 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     const protoLoader =
       this.getOptionsProp(options, 'protoLoader') || GRPC_DEFAULT_PROTO_LOADER;
 
-    grpcPackage = this.loadPackage('grpc', ServerGrpc.name, () =>
-      require('grpc'),
+    grpcPackage = this.loadPackage('@grpc/grpc-js', ServerGrpc.name, () =>
+      require('@grpc/grpc-js'),
     );
-    grpcProtoLoaderPackage = this.loadPackage(protoLoader, ServerGrpc.name);
+    grpcProtoLoaderPackage = this.loadPackage(
+      protoLoader,
+      ServerGrpc.name,
+      () =>
+        protoLoader === GRPC_DEFAULT_PROTO_LOADER
+          ? require('@grpc/proto-loader')
+          : require(protoLoader),
+    );
   }
 
-  public async listen(callback: () => void) {
-    this.grpcClient = this.createClient();
-    await this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ) {
+    try {
+      this.grpcClient = await this.createClient();
+      await this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
   public async start(callback?: () => void) {
@@ -71,7 +94,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
 
     for (const packageName of packageNames) {
       const grpcPkg = this.lookupPackage(grpcContext, packageName);
-      await this.createServices(grpcPkg);
+      await this.createServices(grpcPkg, packageName);
     }
   }
 
@@ -206,29 +229,133 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
 
   public createUnaryServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      const handler = methodHandler(call.request, call.metadata);
-      this.transformToObservable(await handler).subscribe(
-        data => callback(null, data),
-        (err: any) => callback(err),
-      );
+      const handler = methodHandler(call.request, call.metadata, call);
+      this.transformToObservable(await handler).subscribe({
+        next: async data => callback(null, await data),
+        error: (err: any) => callback(err),
+      });
     };
   }
 
   public createStreamServiceMethod(methodHandler: Function): Function {
     return async (call: GrpcCall, callback: Function) => {
-      const handler = methodHandler(call.request, call.metadata);
+      const handler = methodHandler(call.request, call.metadata, call);
       const result$ = this.transformToObservable(await handler);
-      await result$
-        .pipe(
-          takeUntil(fromEvent(call as any, CANCEL_EVENT)),
-          catchError(err => {
-            call.emit('error', err);
-            return EMPTY;
-          }),
-        )
-        .forEach(data => call.write(data));
-      call.end();
+
+      try {
+        await this.writeObservableToGrpc(result$, call);
+      } catch (err) {
+        call.emit('error', err);
+        return;
+      }
     };
+  }
+
+  /**
+   * Writes an observable to a GRPC call.
+   *
+   * This function will ensure that backpressure is managed while writing values
+   * that come from an observable to a GRPC call.
+   *
+   * @param source The observable we want to write out to the GRPC call.
+   * @param call The GRPC call we want to write to.
+   * @returns A promise that resolves when we're done writing to the call.
+   */
+  public writeObservableToGrpc<T>(
+    source: Observable<T>,
+    call: GrpcCall<T>,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const valuesWaitingToBeDrained: T[] = [];
+      let shouldErrorAfterDraining = false;
+      let error: any;
+      let shouldResolveAfterDraining = false;
+      let writing = true;
+
+      // Used to manage finalization
+      const subscription = new Subscription();
+
+      // If the call is cancelled, unsubscribe from the source
+      const cancelHandler = () => {
+        subscription.unsubscribe();
+        // The call has been cancelled, so we need to either resolve
+        // or reject the promise. We're resolving in this case because
+        // rejection is noisy. If at any point in the future, we need to
+        // know that cancellation happened, we can either reject or
+        // start resolving with some sort of outcome value.
+        resolve();
+      };
+      call.on(CANCEL_EVENT, cancelHandler);
+      subscription.add(() => call.off(CANCEL_EVENT, cancelHandler));
+
+      // In all cases, when we finalize, end the writable stream
+      subscription.add(() => call.end());
+
+      const drain = () => {
+        writing = true;
+        while (valuesWaitingToBeDrained.length > 0) {
+          const value = valuesWaitingToBeDrained.shift()!;
+          if (writing) {
+            // The first time `call.write` returns false, we need to stop.
+            // It wrote the value, but it won't write anything else.
+            writing = call.write(value);
+            if (!writing) {
+              // We can't write anymore so we need to wait for the drain event
+              return;
+            }
+          }
+        }
+
+        if (shouldResolveAfterDraining) {
+          subscription.unsubscribe();
+          resolve();
+        } else if (shouldErrorAfterDraining) {
+          subscription.unsubscribe();
+          reject(error);
+        }
+      };
+
+      call.on('drain', drain);
+      subscription.add(() => call.off('drain', drain));
+
+      subscription.add(
+        source.subscribe({
+          next(value) {
+            if (writing) {
+              writing = call.write(value);
+            } else {
+              // If we can't write, that's because we need to
+              // wait for the drain event before we can write again
+              // buffer the value and wait for the drain event
+              valuesWaitingToBeDrained.push(value);
+            }
+          },
+          error(err) {
+            if (valuesWaitingToBeDrained.length === 0) {
+              // We're not waiting for a drain event, so we can just
+              // reject and teardown.
+              subscription.unsubscribe();
+              reject(err);
+            } else {
+              // We're waiting for a drain event, record the
+              // error so it can be handled after everything is drained.
+              shouldErrorAfterDraining = true;
+              error = err;
+            }
+          },
+          complete() {
+            if (valuesWaitingToBeDrained.length === 0) {
+              // We're not waiting for a drain event, so we can just
+              // resolve and teardown.
+              subscription.unsubscribe();
+              resolve();
+            } else {
+              shouldResolveAfterDraining = true;
+            }
+          },
+        }),
+      );
+    });
   }
 
   public createRequestStreamMethod(
@@ -254,32 +381,28 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
       });
       call.on('end', () => req.complete());
 
-      const handler = methodHandler(req.asObservable(), call.metadata);
+      const handler = methodHandler(req.asObservable(), call.metadata, call);
       const res = this.transformToObservable(await handler);
       if (isResponseStream) {
-        await res
-          .pipe(
-            takeUntil(fromEvent(call as any, CANCEL_EVENT)),
-            catchError(err => {
-              call.emit('error', err);
-              return EMPTY;
-            }),
-          )
-          .forEach(m => call.write(m));
-
-        call.end();
+        try {
+          await this.writeObservableToGrpc(res, call);
+        } catch (err) {
+          call.emit('error', err);
+          return;
+        }
       } else {
-        const response = await res
-          .pipe(
+        const response = await lastValueFrom(
+          res.pipe(
             takeUntil(fromEvent(call as any, CANCEL_EVENT)),
             catchError(err => {
               callback(err, null);
               return EMPTY;
             }),
-          )
-          .toPromise();
+            defaultIfEmpty(undefined),
+          ),
+        );
 
-        if (typeof response !== 'undefined') {
+        if (!isUndefined(response)) {
           callback(null, response);
         }
       }
@@ -302,8 +425,20 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     };
   }
 
-  public close() {
-    this.grpcClient && this.grpcClient.forceShutdown();
+  public async close(): Promise<void> {
+    if (this.grpcClient) {
+      const graceful = this.getOptionsProp(this.options, 'gracefulShutdown');
+      if (graceful) {
+        await new Promise<void>((resolve, reject) => {
+          this.grpcClient.tryShutdown((error: Error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        });
+      } else {
+        this.grpcClient.forceShutdown();
+      }
+    }
     this.grpcClient = null;
   }
 
@@ -316,7 +451,7 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
   }
 
   public addHandler(
-    pattern: any,
+    pattern: unknown,
     callback: MessageHandler,
     isEventHandler = false,
   ) {
@@ -325,33 +460,34 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     this.messageHandlers.set(route, callback);
   }
 
-  public createClient(): any {
-    const grpcOptions = {
-      'grpc.max_send_message_length': this.getOptionsProp(
-        this.options,
-        'maxSendMessageLength',
-        GRPC_DEFAULT_MAX_SEND_MESSAGE_LENGTH,
-      ),
-      'grpc.max_receive_message_length': this.getOptionsProp(
-        this.options,
-        'maxReceiveMessageLength',
-        GRPC_DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH,
-      ),
-    };
-    const maxMetadataSize = this.getOptionsProp(
-      this.options,
-      'maxMetadataSize',
-      -1,
-    );
-    if (maxMetadataSize > 0) {
-      grpcOptions['grpc.max_metadata_size'] = maxMetadataSize;
+  public async createClient(): Promise<any> {
+    const channelOptions: ChannelOptions =
+      this.options && this.options.channelOptions
+        ? this.options.channelOptions
+        : {};
+    if (this.options && this.options.maxSendMessageLength) {
+      channelOptions['grpc.max_send_message_length'] =
+        this.options.maxSendMessageLength;
     }
-    const server = new grpcPackage.Server(grpcOptions);
+    if (this.options && this.options.maxReceiveMessageLength) {
+      channelOptions['grpc.max_receive_message_length'] =
+        this.options.maxReceiveMessageLength;
+    }
+    if (this.options && this.options.maxMetadataSize) {
+      channelOptions['grpc.max_metadata_size'] = this.options.maxMetadataSize;
+    }
+    const server = new grpcPackage.Server(channelOptions);
     const credentials = this.getOptionsProp(this.options, 'credentials');
-    server.bind(
-      this.url,
-      credentials || grpcPackage.ServerCredentials.createInsecure(),
-    );
+
+    await new Promise((resolve, reject) => {
+      server.bindAsync(
+        this.url,
+        credentials || grpcPackage.ServerCredentials.createInsecure(),
+        (error: Error | null, port: number) =>
+          error ? reject(error) : resolve(port),
+      );
+    });
+
     return server;
   }
 
@@ -366,21 +502,18 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
 
   public loadProto(): any {
     try {
-      const file = this.getOptionsProp(this.options, 'protoPath');
-      const loader = this.getOptionsProp(this.options, 'loader');
-
-      const packageDefinition = grpcProtoLoaderPackage.loadSync(file, loader);
-      const packageObject = grpcPackage.loadPackageDefinition(
-        packageDefinition,
+      const packageDefinition = getGrpcPackageDefinition(
+        this.options,
+        grpcProtoLoaderPackage,
       );
-      return packageObject;
+      return grpcPackage.loadPackageDefinition(packageDefinition);
     } catch (err) {
-      const invalidProtoError = new InvalidProtoDefinitionException();
+      const invalidProtoError = new InvalidProtoDefinitionException(err.path);
       const message =
         err && err.message ? err.message : invalidProtoError.message;
 
       this.logger.error(message, invalidProtoError.stack);
-      throw err;
+      throw invalidProtoError;
     }
   }
 
@@ -439,9 +572,9 @@ export class ServerGrpc extends Server implements CustomTransportStrategy {
     return name + '.' + key;
   }
 
-  private async createServices(grpcPkg: any) {
+  private async createServices(grpcPkg: any, packageName: string) {
     if (!grpcPkg) {
-      const invalidPackageError = new InvalidGrpcPackageException();
+      const invalidPackageError = new InvalidGrpcPackageException(packageName);
       this.logger.error(invalidPackageError.message, invalidPackageError.stack);
       throw invalidPackageError;
     }

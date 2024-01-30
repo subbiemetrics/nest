@@ -2,7 +2,7 @@ import {
   PROPERTY_DEPS_METADATA,
   SELF_DECLARED_DEPS_METADATA,
 } from '../../constants';
-import { isFunction, isUndefined } from '../../utils/shared.utils';
+import { isUndefined } from '../../utils/shared.utils';
 
 /**
  * Decorator that marks a constructor parameter as a target for
@@ -33,11 +33,17 @@ import { isFunction, isUndefined } from '../../utils/shared.utils';
  *
  * @publicApi
  */
-export function Inject<T = any>(token?: T) {
-  return (target: object, key: string | symbol, index?: number) => {
-    token = token || Reflect.getMetadata('design:type', target, key);
-    const type =
-      token && isFunction(token) ? ((token as any) as Function).name : token;
+export function Inject<T = any>(
+  token?: T,
+): PropertyDecorator & ParameterDecorator {
+  return (target: object, key: string | symbol | undefined, index?: number) => {
+    const type = token || Reflect.getMetadata('design:type', target, key);
+
+    if (!type) {
+      throw new Error(`Token is undefined at index: ${index}. This often occurs due to circular dependencies.
+Ensure there are no circular dependencies in your files or barrel files. 
+For more details, refer to https://trilon.io/blog/avoiding-circular-dependencies-in-nestjs.`);
+    }
 
     if (!isUndefined(index)) {
       let dependencies =

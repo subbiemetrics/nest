@@ -2,17 +2,21 @@ import {
   INestApplicationContext,
   Logger,
   LoggerService,
+  LogLevel,
   ShutdownSignal,
 } from '@nestjs/common';
-import { Abstract, Scope } from '@nestjs/common/interfaces';
-import { Type } from '@nestjs/common/interfaces/type.interface';
+import {
+  Abstract,
+  DynamicModule,
+  GetOrResolveOptions,
+  Type,
+} from '@nestjs/common/interfaces';
+import { NestApplicationContextOptions } from '@nestjs/common/interfaces/nest-application-context-options.interface';
 import { isEmpty } from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
 import { MESSAGES } from './constants';
-import { InvalidClassScopeException } from './errors/exceptions/invalid-class-scope.exception';
-import { UnknownElementException } from './errors/exceptions/unknown-element.exception';
-import { UnknownModuleException } from './errors/exceptions/unknown-module.exception';
-import { createContextId } from './helpers';
+import { UnknownModuleException } from './errors/exceptions';
+import { createContextId } from './helpers/context-id-factory';
 import {
   callAppShutdownHook,
   callBeforeAppShutdownHook,
@@ -20,23 +24,38 @@ import {
   callModuleDestroyHook,
   callModuleInitHook,
 } from './hooks';
-import { ContextId } from './injector';
+import { AbstractInstanceResolver } from './injector/abstract-instance-resolver';
+import { ModuleCompiler } from './injector/compiler';
 import { NestContainer } from './injector/container';
 import { Injector } from './injector/injector';
 import { InstanceLinksHost } from './injector/instance-links-host';
+import { ContextId } from './injector/instance-wrapper';
 import { Module } from './injector/module';
 
 /**
  * @publicApi
  */
-export class NestApplicationContext implements INestApplicationContext {
+export class NestApplicationContext<
+    TOptions extends
+      NestApplicationContextOptions = NestApplicationContextOptions,
+  >
+  extends AbstractInstanceResolver
+  implements INestApplicationContext
+{
   protected isInitialized = false;
-  protected readonly injector = new Injector();
-  private shutdownCleanupRef?: (...args: unknown[]) => unknown;
-  private readonly activeShutdownSignals = new Array<string>();
-  private _instanceLinksHost: InstanceLinksHost;
+  protected injector: Injector;
+  protected readonly logger = new Logger(NestApplicationContext.name, {
+    timestamp: true,
+  });
 
-  private get instanceLinksHost() {
+  private shouldFlushLogsOnOverride = false;
+  private readonly activeShutdownSignals = new Array<string>();
+  private readonly moduleCompiler = new ModuleCompiler();
+  private shutdownCleanupRef?: (...args: unknown[]) => unknown;
+  private _instanceLinksHost: InstanceLinksHost;
+  private _moduleRefsForHooksByDistance?: Array<Module>;
+
+  protected get instanceLinksHost() {
     if (!this._instanceLinksHost) {
       this._instanceLinksHost = new InstanceLinksHost(this.container);
     }
@@ -45,44 +64,151 @@ export class NestApplicationContext implements INestApplicationContext {
 
   constructor(
     protected readonly container: NestContainer,
-    private readonly scope = new Array<Type<any>>(),
+    protected readonly appOptions: TOptions = {} as TOptions,
     private contextModule: Module = null,
-  ) {}
+    private readonly scope = new Array<Type<any>>(),
+  ) {
+    super();
+    this.injector = new Injector();
+
+    if (this.appOptions.preview) {
+      this.printInPreviewModeWarning();
+    }
+  }
 
   public selectContextModule() {
     const modules = this.container.getModules().values();
     this.contextModule = modules.next().value;
   }
 
-  public select<T>(moduleType: Type<T>): INestApplicationContext {
-    const modules = this.container.getModules();
-    const moduleMetatype = this.contextModule.metatype;
-    const scope = this.scope.concat(moduleMetatype);
-    const moduleTokenFactory = this.container.getModuleTokenFactory();
+  /**
+   * Allows navigating through the modules tree, for example, to pull out a specific instance from the selected module.
+   * @returns {INestApplicationContext}
+   */
+  public select<T>(
+    moduleType: Type<T> | DynamicModule,
+  ): INestApplicationContext {
+    const modulesContainer = this.container.getModules();
+    const contextModuleCtor = this.contextModule.metatype;
+    const scope = this.scope.concat(contextModuleCtor);
 
-    const token = moduleTokenFactory.create(moduleType);
-    const selectedModule = modules.get(token);
+    const moduleTokenFactory = this.container.getModuleTokenFactory();
+    const { type, dynamicMetadata } =
+      this.moduleCompiler.extractMetadata(moduleType);
+    const token = moduleTokenFactory.create(type, dynamicMetadata);
+
+    const selectedModule = modulesContainer.get(token);
     if (!selectedModule) {
-      throw new UnknownModuleException();
+      throw new UnknownModuleException(type.name);
     }
-    return new NestApplicationContext(this.container, scope, selectedModule);
+    return new NestApplicationContext(
+      this.container,
+      this.appOptions,
+      selectedModule,
+      scope,
+    );
   }
 
+  /**
+   * Retrieves an instance of either injectable or controller, otherwise, throws exception.
+   * @returns {TResult}
+   */
+  public get<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+  ): TResult;
+  /**
+   * Retrieves an instance of either injectable or controller, otherwise, throws exception.
+   * @returns {TResult}
+   */
+  public get<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    options: {
+      strict?: boolean;
+      each?: undefined | false;
+    },
+  ): TResult;
+  /**
+   * Retrieves a list of instances of either injectables or controllers, otherwise, throws exception.
+   * @returns {Array<TResult>}
+   */
+  public get<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    options: {
+      strict?: boolean;
+      each: true;
+    },
+  ): Array<TResult>;
+  /**
+   * Retrieves an instance (or a list of instances) of either injectable or controller, otherwise, throws exception.
+   * @returns {TResult | Array<TResult>}
+   */
   public get<TInput = any, TResult = TInput>(
     typeOrToken: Type<TInput> | Abstract<TInput> | string | symbol,
-    options: { strict: boolean } = { strict: false },
-  ): TResult {
+    options: GetOrResolveOptions = { strict: false },
+  ): TResult | Array<TResult> {
     return !(options && options.strict)
-      ? this.find<TInput, TResult>(typeOrToken)
-      : this.find<TInput, TResult>(typeOrToken, this.contextModule);
+      ? this.find<TInput, TResult>(typeOrToken, options)
+      : this.find<TInput, TResult>(typeOrToken, {
+          moduleId: this.contextModule?.id,
+          each: options.each,
+        });
   }
 
+  /**
+   * Resolves transient or request-scoped instance of either injectable or controller, otherwise, throws exception.
+   * @returns {Array<TResult>}
+   */
   public resolve<TInput = any, TResult = TInput>(
-    typeOrToken: Type<TInput> | string | symbol,
+    typeOrToken: Type<TInput> | Function | string | symbol,
+  ): Promise<TResult>;
+  /**
+   * Resolves transient or request-scoped instance of either injectable or controller, otherwise, throws exception.
+   * @returns {Array<TResult>}
+   */
+  public resolve<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    contextId?: {
+      id: number;
+    },
+  ): Promise<TResult>;
+  /**
+   * Resolves transient or request-scoped instance of either injectable or controller, otherwise, throws exception.
+   * @returns {Array<TResult>}
+   */
+  public resolve<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    contextId?: {
+      id: number;
+    },
+    options?: {
+      strict?: boolean;
+      each?: undefined | false;
+    },
+  ): Promise<TResult>;
+  /**
+   * Resolves transient or request-scoped instances of either injectables or controllers, otherwise, throws exception.
+   * @returns {Array<TResult>}
+   */
+  public resolve<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    contextId?: {
+      id: number;
+    },
+    options?: {
+      strict?: boolean;
+      each: true;
+    },
+  ): Promise<Array<TResult>>;
+  /**
+   * Resolves transient or request-scoped instance (or a list of instances) of either injectable or controller, otherwise, throws exception.
+   * @returns {Promise<TResult | Array<TResult>>}
+   */
+  public resolve<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Abstract<TInput> | string | symbol,
     contextId = createContextId(),
-    options: { strict: boolean } = { strict: false },
-  ): Promise<TResult> {
-    return this.resolvePerContext(
+    options: GetOrResolveOptions = { strict: false },
+  ): Promise<TResult | Array<TResult>> {
+    return this.resolvePerContext<TInput, TResult>(
       typeOrToken,
       this.contextModule,
       contextId,
@@ -90,12 +216,16 @@ export class NestApplicationContext implements INestApplicationContext {
     );
   }
 
+  /**
+   * Registers the request/context object for a given context ID (DI container sub-tree).
+   * @returns {void}
+   */
   public registerRequestByContextId<T = any>(request: T, contextId: ContextId) {
     this.container.registerRequestProvider(request, contextId);
   }
 
   /**
-   * Initalizes the Nest application.
+   * Initializes the Nest application.
    * Calls the Nest lifecycle events.
    *
    * @returns {Promise<this>} The NestApplicationContext instance as Promise
@@ -111,16 +241,44 @@ export class NestApplicationContext implements INestApplicationContext {
     return this;
   }
 
-  public async close(): Promise<void> {
+  /**
+   * Terminates the application
+   * @returns {Promise<void>}
+   */
+  public async close(signal?: string): Promise<void> {
     await this.callDestroyHook();
-    await this.callBeforeShutdownHook();
+    await this.callBeforeShutdownHook(signal);
     await this.dispose();
-    await this.callShutdownHook();
+    await this.callShutdownHook(signal);
     this.unsubscribeFromProcessSignals();
   }
 
-  public useLogger(logger: LoggerService) {
+  /**
+   * Sets custom logger service.
+   * Flushes buffered logs if auto flush is on.
+   * @returns {void}
+   */
+  public useLogger(logger: LoggerService | LogLevel[] | false) {
     Logger.overrideLogger(logger);
+
+    if (this.shouldFlushLogsOnOverride) {
+      this.flushLogs();
+    }
+  }
+
+  /**
+   * Prints buffered logs and detaches buffer.
+   * @returns {void}
+   */
+  public flushLogs() {
+    Logger.flush();
+  }
+
+  /**
+   * Define that it must flush logs right after defining a custom logger.
+   */
+  public flushLogsOnOverride() {
+    this.shouldFlushLogsOnOverride = true;
   }
 
   /**
@@ -166,18 +324,25 @@ export class NestApplicationContext implements INestApplicationContext {
    * @param {string[]} signals The system signals it should listen to
    */
   protected listenToShutdownSignals(signals: string[]) {
+    let receivedSignal = false;
     const cleanup = async (signal: string) => {
       try {
-        signals.forEach(sig => process.removeListener(sig, cleanup));
+        if (receivedSignal) {
+          // If we receive another signal while we're waiting
+          // for the server to stop, just ignore it.
+          return;
+        }
+        receivedSignal = true;
         await this.callDestroyHook();
         await this.callBeforeShutdownHook(signal);
         await this.dispose();
         await this.callShutdownHook(signal);
+        signals.forEach(sig => process.removeListener(sig, cleanup));
         process.kill(process.pid, signal);
       } catch (err) {
         Logger.error(
           MESSAGES.ERROR_DURING_SHUTDOWN,
-          (err as Error).stack,
+          (err as Error)?.stack,
           NestApplicationContext.name,
         );
         process.exit(1);
@@ -208,8 +373,8 @@ export class NestApplicationContext implements INestApplicationContext {
    * modules and its children.
    */
   protected async callInitHook(): Promise<void> {
-    const modulesContainer = this.container.getModules();
-    for (const module of [...modulesContainer.values()].reverse()) {
+    const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+    for (const module of modulesSortedByDistance) {
       await callModuleInitHook(module);
     }
   }
@@ -219,8 +384,8 @@ export class NestApplicationContext implements INestApplicationContext {
    * modules and its children.
    */
   protected async callDestroyHook(): Promise<void> {
-    const modulesContainer = this.container.getModules();
-    for (const module of modulesContainer.values()) {
+    const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+    for (const module of modulesSortedByDistance) {
       await callModuleDestroyHook(module);
     }
   }
@@ -230,8 +395,8 @@ export class NestApplicationContext implements INestApplicationContext {
    * modules and its children.
    */
   protected async callBootstrapHook(): Promise<void> {
-    const modulesContainer = this.container.getModules();
-    for (const module of [...modulesContainer.values()].reverse()) {
+    const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+    for (const module of modulesSortedByDistance) {
       await callModuleBootstrapHook(module);
     }
   }
@@ -241,8 +406,8 @@ export class NestApplicationContext implements INestApplicationContext {
    * modules and children.
    */
   protected async callShutdownHook(signal?: string): Promise<void> {
-    const modulesContainer = this.container.getModules();
-    for (const module of [...modulesContainer.values()].reverse()) {
+    const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+    for (const module of modulesSortedByDistance) {
       await callAppShutdownHook(module, signal);
     }
   }
@@ -252,56 +417,40 @@ export class NestApplicationContext implements INestApplicationContext {
    * modules and children.
    */
   protected async callBeforeShutdownHook(signal?: string): Promise<void> {
-    const modulesContainer = this.container.getModules();
-    for (const module of [...modulesContainer.values()].reverse()) {
+    const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+    for (const module of modulesSortedByDistance) {
       await callBeforeAppShutdownHook(module, signal);
     }
   }
 
-  protected find<TInput = any, TResult = TInput>(
-    typeOrToken: Type<TInput> | Abstract<TInput> | string | symbol,
-    contextModule?: Module,
-  ): TResult {
-    const moduleId = contextModule && contextModule.id;
-    const { wrapperRef } = this.instanceLinksHost.get<TResult>(
-      typeOrToken,
-      moduleId,
-    );
-    if (
-      wrapperRef.scope === Scope.REQUEST ||
-      wrapperRef.scope === Scope.TRANSIENT
-    ) {
-      throw new InvalidClassScopeException(typeOrToken);
+  protected assertNotInPreviewMode(methodName: string) {
+    if (this.appOptions.preview) {
+      const error = `Calling the "${methodName}" in the preview mode is not supported.`;
+      this.logger.error(error);
+      throw new Error(error);
     }
-    return wrapperRef.instance;
   }
 
-  protected async resolvePerContext<TInput = any, TResult = TInput>(
-    typeOrToken: Type<TInput> | string | symbol,
-    contextModule: Module,
-    contextId: ContextId,
-    options?: { strict: boolean },
-  ): Promise<TResult> {
-    const isStrictModeEnabled = options && options.strict;
-    const instanceLink = isStrictModeEnabled
-      ? this.instanceLinksHost.get(typeOrToken, contextModule.id)
-      : this.instanceLinksHost.get(typeOrToken);
-
-    const { wrapperRef, collection } = instanceLink;
-    if (wrapperRef.isDependencyTreeStatic() && !wrapperRef.isTransient) {
-      return this.get(typeOrToken);
+  private getModulesToTriggerHooksOn(): Module[] {
+    if (this._moduleRefsForHooksByDistance) {
+      return this._moduleRefsForHooksByDistance;
     }
-
-    const ctorHost = wrapperRef.instance || { constructor: typeOrToken };
-    const instance = await this.injector.loadPerContext(
-      ctorHost,
-      wrapperRef.host,
-      collection,
-      contextId,
+    const modulesContainer = this.container.getModules();
+    const compareFn = (a: Module, b: Module) => b.distance - a.distance;
+    const modulesSortedByDistance = Array.from(modulesContainer.values()).sort(
+      compareFn,
     );
-    if (!instance) {
-      throw new UnknownElementException();
-    }
-    return instance;
+
+    this._moduleRefsForHooksByDistance = this.appOptions?.preview
+      ? modulesSortedByDistance.filter(moduleRef => moduleRef.initOnPreview)
+      : modulesSortedByDistance;
+    return this._moduleRefsForHooksByDistance;
+  }
+
+  private printInPreviewModeWarning() {
+    this.logger.warn('------------------------------------------------');
+    this.logger.warn('Application is running in the PREVIEW mode!');
+    this.logger.warn('Providers/controllers will not be instantiated.');
+    this.logger.warn('------------------------------------------------');
   }
 }

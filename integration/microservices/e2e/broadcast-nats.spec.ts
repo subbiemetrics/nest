@@ -1,5 +1,5 @@
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
 import * as request from 'supertest';
 import { NatsBroadcastController } from '../src/nats/nats-broadcast.controller';
@@ -16,19 +16,19 @@ describe('NATS transport', () => {
     app = module.createNestApplication();
     server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.NATS,
       options: {
-        url: 'nats://0.0.0.0:4222',
+        servers: 'nats://0.0.0.0:4222',
       },
     });
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.NATS,
       options: {
-        url: 'nats://0.0.0.0:4222',
+        servers: 'servers://0.0.0.0:4222',
       },
     });
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
   });
 

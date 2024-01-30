@@ -1,4 +1,4 @@
-import { CUSTOM_ROUTE_AGRS_METADATA } from '@nestjs/common/constants';
+import { CUSTOM_ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
 import { Body, createParamDecorator, Request } from '@nestjs/common/decorators';
 import { RouteParamtypes } from '@nestjs/common/enums/route-paramtypes.enum';
 import { expect } from 'chai';
@@ -21,7 +21,7 @@ describe('ContextUtils', () => {
         @CustomDecorator() custom,
       ) {}
     }
-    it('should returns ROUTE_ARGS_METADATA callback metadata', () => {
+    it('should return ROUTE_ARGS_METADATA callback metadata', () => {
       const instance = new TestController();
       const metadata = contextUtils.reflectCallbackMetadata(
         instance,
@@ -40,7 +40,7 @@ describe('ContextUtils', () => {
           data: undefined,
           pipes: [],
         },
-        [`custom${CUSTOM_ROUTE_AGRS_METADATA}:2`]: {
+        [`custom${CUSTOM_ROUTE_ARGS_METADATA}:2`]: {
           index: 2,
           factory: () => {},
           data: undefined,
@@ -54,7 +54,7 @@ describe('ContextUtils', () => {
       );
 
       const keys = Object.keys(metadata);
-      const custom = keys.find(key => key.includes(CUSTOM_ROUTE_AGRS_METADATA));
+      const custom = keys.find(key => key.includes(CUSTOM_ROUTE_ARGS_METADATA));
 
       expect(metadata[custom]).to.be.an('object');
       expect(metadata[custom].index).to.be.eq(2);
@@ -63,7 +63,7 @@ describe('ContextUtils', () => {
     });
   });
   describe('getArgumentsLength', () => {
-    it('should returns maximum index + 1 (length) placed in array', () => {
+    it('should return maximum index + 1 (length) placed in array', () => {
       const max = 4;
       const metadata = {
         [RouteParamtypes.REQUEST]: { index: 0 },
@@ -87,7 +87,7 @@ describe('ContextUtils', () => {
     });
   });
   describe('mergeParamsMetatypes', () => {
-    it('should return "paramsProperties" when paramtypes array doesnt exists', () => {
+    it('should return "paramsProperties" when paramtypes array doesn\'t exists', () => {
       const paramsProperties = ['1'];
       expect(
         contextUtils.mergeParamsMetatypes(paramsProperties as any, null),

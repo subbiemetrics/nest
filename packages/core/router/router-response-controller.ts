@@ -1,9 +1,23 @@
-import { HttpServer, HttpStatus, RequestMethod } from '@nestjs/common';
-import { isFunction } from '@nestjs/common/utils/shared.utils';
+import {
+  HttpServer,
+  HttpStatus,
+  Logger,
+  RequestMethod,
+  MessageEvent,
+} from '@nestjs/common';
+import { isObject } from '@nestjs/common/utils/shared.utils';
+import { IncomingMessage } from 'http';
+import { EMPTY, lastValueFrom, Observable, isObservable } from 'rxjs';
+import { catchError, debounce, map } from 'rxjs/operators';
+import {
+  AdditionalHeaders,
+  WritableHeaderStream,
+  SseStream,
+} from './sse-stream';
 
 export interface CustomHeader {
   name: string;
-  value: string;
+  value: string | (() => string);
 }
 
 export interface RedirectResponse {
@@ -12,6 +26,8 @@ export interface RedirectResponse {
 }
 
 export class RouterResponseController {
+  private readonly logger = new Logger(RouterResponseController.name);
+
   constructor(private readonly applicationRef: HttpServer) {}
 
   public async apply<TInput = any, TResponse = any>(
@@ -32,8 +48,8 @@ export class RouterResponseController {
       result && result.statusCode
         ? result.statusCode
         : redirectResponse.statusCode
-        ? redirectResponse.statusCode
-        : HttpStatus.FOUND;
+          ? redirectResponse.statusCode
+          : HttpStatus.FOUND;
     const url = result && result.url ? result.url : redirectResponse.url;
     this.applicationRef.redirect(response, statusCode, url);
   }
@@ -44,12 +60,12 @@ export class RouterResponseController {
     template: string,
   ) {
     const result = await this.transformToResult(resultOrDeferred);
-    this.applicationRef.render(response, template, result);
+    return this.applicationRef.render(response, template, result);
   }
 
   public async transformToResult(resultOrDeferred: any) {
-    if (resultOrDeferred && isFunction(resultOrDeferred.subscribe)) {
-      return resultOrDeferred.toPromise();
+    if (isObservable(resultOrDeferred)) {
+      return lastValueFrom(resultOrDeferred);
     }
     return resultOrDeferred;
   }
@@ -68,7 +84,11 @@ export class RouterResponseController {
     headers: CustomHeader[],
   ) {
     headers.forEach(({ name, value }) =>
-      this.applicationRef.setHeader(response, name, value),
+      this.applicationRef.setHeader(
+        response,
+        name,
+        typeof value === 'function' ? value() : value
+      ),
     );
   }
 
@@ -77,5 +97,70 @@ export class RouterResponseController {
     statusCode: number,
   ) {
     this.applicationRef.status(response, statusCode);
+  }
+
+  public sse<
+    TInput extends Observable<unknown> = any,
+    TResponse extends WritableHeaderStream = any,
+    TRequest extends IncomingMessage = any,
+  >(
+    result: TInput,
+    response: TResponse,
+    request: TRequest,
+    options?: { additionalHeaders: AdditionalHeaders },
+  ) {
+    // It's possible that we sent headers already so don't use a stream
+    if (response.writableEnded) {
+      return;
+    }
+
+    this.assertObservable(result);
+
+    const stream = new SseStream(request);
+    stream.pipe(response, options);
+
+    const subscription = result
+      .pipe(
+        map((message): MessageEvent => {
+          if (isObject(message)) {
+            return message as MessageEvent;
+          }
+
+          return { data: message as object | string };
+        }),
+        debounce(
+          message =>
+            new Promise<void>(resolve =>
+              stream.writeMessage(message, () => resolve()),
+            ),
+        ),
+        catchError(err => {
+          const data = err instanceof Error ? err.message : err;
+          stream.writeMessage({ type: 'error', data }, writeError => {
+            if (writeError) {
+              this.logger.error(writeError);
+            }
+          });
+
+          return EMPTY;
+        }),
+      )
+      .subscribe({
+        complete: () => {
+          response.end();
+        },
+      });
+
+    request.on('close', () => {
+      subscription.unsubscribe();
+    });
+  }
+
+  private assertObservable(value: any) {
+    if (!isObservable(value)) {
+      throw new ReferenceError(
+        'You must return an Observable stream to use Server-Sent Events (SSE).',
+      );
+    }
   }
 }

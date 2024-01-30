@@ -1,10 +1,10 @@
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
 import { expect } from 'chai';
 import * as request from 'supertest';
 import { AppController } from '../src/app.controller';
-import { ApplicationModule } from '../src/app.module';
+import { AppModule } from '../src/app.module';
 
 describe('RPC transport', () => {
   let server;
@@ -12,19 +12,19 @@ describe('RPC transport', () => {
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication();
     server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.TCP,
       options: {
         host: '0.0.0.0',
       },
     });
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
   });
 
@@ -103,6 +103,22 @@ describe('RPC transport', () => {
           done();
         }, 1000);
       });
+  });
+
+  it('/POST (custom client)', () => {
+    return request(server)
+      .post('/error?client=custom')
+      .send({})
+      .expect(200)
+      .expect('true');
+  });
+
+  it('/POST (standard client)', () => {
+    return request(server)
+      .post('/error?client=standard')
+      .send({})
+      .expect(200)
+      .expect('false');
   });
 
   afterEach(async () => {

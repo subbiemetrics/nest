@@ -1,8 +1,9 @@
-import { expect } from 'chai';
+import { assert, expect } from 'chai';
 import * as sinon from 'sinon';
 import { NO_MESSAGE_HANDLER } from '../../constants';
 import { BaseRpcContext } from '../../ctx-host/base-rpc.context';
 import { ServerRMQ } from '../../server/server-rmq';
+import { RmqContext } from '../../ctx-host';
 
 describe('ServerRMQ', () => {
   let server: ServerRMQ;
@@ -19,6 +20,7 @@ describe('ServerRMQ', () => {
     let createChannelStub: sinon.SinonStub;
     let setupChannelStub: sinon.SinonStub;
     let client: any;
+    let callbackSpy: sinon.SinonSpy;
 
     beforeEach(() => {
       onStub = sinon
@@ -27,27 +29,44 @@ describe('ServerRMQ', () => {
       createChannelStub = sinon.stub().callsFake(({ setup }) => setup());
       setupChannelStub = sinon
         .stub(server, 'setupChannel')
-        .callsFake(() => ({} as any));
+        .callsFake(() => ({}) as any);
 
       client = {
         on: onStub,
         createChannel: createChannelStub,
       };
       createClient = sinon.stub(server, 'createClient').callsFake(() => client);
-
-      server.listen(null);
+      callbackSpy = sinon.spy();
     });
     afterEach(() => {
       setupChannelStub.restore();
     });
     it('should call "createClient"', () => {
+      server.listen(callbackSpy);
       expect(createClient.called).to.be.true;
     });
     it('should bind "connect" event to handler', () => {
+      server.listen(callbackSpy);
       expect(onStub.getCall(0).args[0]).to.be.equal('connect');
     });
     it('should bind "disconnect" event to handler', () => {
+      server.listen(callbackSpy);
       expect(onStub.getCall(1).args[0]).to.be.equal('disconnect');
+    });
+    it('should bind "connectFailed" event to handler', () => {
+      server.listen(callbackSpy);
+      expect(onStub.getCall(2).args[0]).to.be.equal('connectFailed');
+    });
+    describe('when "start" throws an exception', () => {
+      it('should call callback with a thrown error as an argument', () => {
+        const error = new Error('random error');
+
+        sinon.stub(server, 'start').callsFake(() => {
+          throw error;
+        });
+        server.listen(callbackSpy);
+        expect(callbackSpy.calledWith(error)).to.be.true;
+      });
     });
   });
   describe('close', () => {
@@ -81,14 +100,19 @@ describe('ServerRMQ', () => {
       data: 'tests',
       id: '3',
     });
+    const channel = {
+      nack: sinon.spy(),
+    };
+
     let sendMessageStub: sinon.SinonStub;
 
     beforeEach(() => {
       sendMessageStub = sinon.stub(server, 'sendMessage').callsFake(() => ({}));
+      (server as any).channel = channel;
     });
-    it('should call "handleEvent" if identifier is not present', () => {
+    it('should call "handleEvent" if identifier is not present', async () => {
       const handleEventSpy = sinon.spy(server, 'handleEvent');
-      server.handleMessage(createMessage({ pattern: '', data: '' }), '');
+      await server.handleMessage(createMessage({ pattern: '', data: '' }), '');
       expect(handleEventSpy.called).to.be.true;
     });
     it('should send NO_MESSAGE_HANDLER error if key does not exists in handlers object', async () => {
@@ -108,6 +132,22 @@ describe('ServerRMQ', () => {
       });
       await server.handleMessage(msg, '');
       expect(handler.calledOnce).to.be.true;
+    });
+    it('should not throw if the message is an invalid json', async () => {
+      const invalidMsg = {
+        content: {
+          toString: () => 'd',
+        },
+        properties: { correlationId: 1 },
+      };
+      const handler = sinon.spy();
+      (server as any).messageHandlers = objectToMap({
+        [pattern]: handler as any,
+      });
+
+      return server.handleMessage(invalidMsg, '').catch(() => {
+        assert.fail('Was not supposed to throw an error');
+      });
     });
   });
   describe('setupChannel', () => {
@@ -189,9 +229,33 @@ describe('ServerRMQ', () => {
       server.handleEvent(
         channel,
         { pattern: '', data },
-        new BaseRpcContext([]),
+        new RmqContext([{}, {}, '']),
       );
       expect(handler.calledWith(data)).to.be.true;
+    });
+
+    it('should negative acknowledge without retrying if key does not exists in handlers object and noAck option is false', () => {
+      const nack = sinon.spy();
+      const message = { pattern: 'no-exists', data };
+      (server as any).channel = {
+        nack,
+      };
+      (server as any).noAck = false;
+      server.handleEvent(channel, message, new RmqContext([message, '', '']));
+
+      expect(nack.calledWith(message, false, false)).to.be.true;
+    });
+
+    it('should not negative acknowledge if key does not exists in handlers object but noAck option is true', () => {
+      const nack = sinon.spy();
+      const message = { pattern: 'no-exists', data };
+      (server as any).channel = {
+        nack,
+      };
+      (server as any).noAck = true;
+      server.handleEvent(channel, message, new RmqContext([message, '', '']));
+
+      expect(nack.calledWith(message, false, false)).not.to.be.true;
     });
   });
 });

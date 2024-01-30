@@ -1,10 +1,10 @@
+import * as GRPC from '@grpc/grpc-js';
 import * as ProtoLoader from '@grpc/proto-loader';
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { Test } from '@nestjs/testing';
 import { fail } from 'assert';
 import { expect } from 'chai';
-import * as GRPC from 'grpc';
 import { join } from 'path';
 import * as request from 'supertest';
 import { GrpcController } from '../src/grpc/grpc.controller';
@@ -22,7 +22,7 @@ describe('GRPC transport', () => {
     app = module.createNestApplication();
     server = app.getHttpAdapter().getInstance();
 
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.GRPC,
       options: {
         package: ['math', 'math2'],
@@ -33,7 +33,7 @@ describe('GRPC transport', () => {
       },
     });
     // Start gRPC microservice
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
     // Load proto-buffers for test gRPC dispatch
     const proto = ProtoLoader.loadSync(
@@ -48,11 +48,28 @@ describe('GRPC transport', () => {
     );
   });
 
-  it(`GRPC Sending and Receiving HTTP POST`, () => {
-    return request(server)
+  it(`GRPC Sending and Receiving HTTP POST`, async () => {
+    await request(server)
       .post('/sum')
       .send([1, 2, 3, 4, 5])
       .expect(200, { result: 15 });
+
+    await request(server)
+      .post('/upperMethod/sum')
+      .send([1, 2, 3, 4, 5])
+      .expect(200, { result: 15 });
+  });
+
+  it(`GRPC Receiving serialized Error`, async () => {
+    await request(server)
+      .post('/error?client=standard')
+      .expect(200)
+      .expect('false');
+
+    await request(server)
+      .post('/error?client=custom')
+      .expect(200)
+      .expect('true');
   });
 
   it(`GRPC Sending and Receiving HTTP POST (multiple proto)`, async () => {
@@ -78,7 +95,7 @@ describe('GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
@@ -100,7 +117,7 @@ describe('GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
@@ -111,8 +128,28 @@ describe('GRPC transport', () => {
     });
   });
 
+  it(`GRPC with backpressure control`, async function () {
+    // This test hit the gRPC server with 1000 messages, but the server
+    // has to process large (> 1MB) messages, so it will definitely hit
+    // issues where writing to the stream needs to be paused until a drain
+    // event. Prior to this test, a bug existed where the server would
+    // send the incorrect number of messages due to improper backpressure
+    // handling that wrote messages more than once.
+    this.timeout(10000);
+
+    const largeMessages = client.streamLargeMessages();
+    // [0, 1, 2, ..., 999]
+    const expectedIds = Array.from({ length: 1000 }, (_, n) => n);
+    const receivedIds: number[] = [];
+
+    await largeMessages.forEach(msg => {
+      receivedIds.push(msg.id);
+    });
+
+    expect(receivedIds).to.deep.equal(expectedIds);
+  });
+
   after(async () => {
     await app.close();
-    client.close();
   });
 });

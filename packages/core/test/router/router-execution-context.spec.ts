@@ -1,14 +1,17 @@
 import { ForbiddenException } from '@nestjs/common/exceptions/forbidden.exception';
 import { expect } from 'chai';
+import { of } from 'rxjs';
 import * as sinon from 'sinon';
+import { PassThrough } from 'stream';
 import { HttpException, HttpStatus, RouteParamMetadata } from '../../../common';
-import { CUSTOM_ROUTE_AGRS_METADATA } from '../../../common/constants';
+import { CUSTOM_ROUTE_ARGS_METADATA } from '../../../common/constants';
 import { RouteParamtypes } from '../../../common/enums/route-paramtypes.enum';
 import { AbstractHttpAdapter } from '../../adapters';
 import { ApplicationConfig } from '../../application-config';
 import { FORBIDDEN_MESSAGE } from '../../guards/constants';
 import { GuardsConsumer } from '../../guards/guards-consumer';
 import { GuardsContextCreator } from '../../guards/guards-context-creator';
+import { HandlerResponseBasicFn } from '../../helpers/handler-metadata-storage';
 import { NestContainer } from '../../injector/container';
 import { InterceptorsConsumer } from '../../interceptors/interceptors-consumer';
 import { InterceptorsContextCreator } from '../../interceptors/interceptors-context-creator';
@@ -16,6 +19,7 @@ import { PipesConsumer } from '../../pipes/pipes-consumer';
 import { PipesContextCreator } from '../../pipes/pipes-context-creator';
 import { RouteParamsFactory } from '../../router/route-params-factory';
 import { RouterExecutionContext } from '../../router/router-execution-context';
+import { HeaderStream } from '../../router/sse-stream';
 import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
 
 describe('RouterExecutionContext', () => {
@@ -179,7 +183,7 @@ describe('RouterExecutionContext', () => {
       const metadata = {
         [RouteParamtypes.REQUEST]: { index: 0, data: 'test', pipes: [] },
         [RouteParamtypes.BODY]: { index: 2, data: 'test', pipes: [] },
-        [`key${CUSTOM_ROUTE_AGRS_METADATA}`]: {
+        [`key${CUSTOM_ROUTE_ARGS_METADATA}`]: {
           index: 3,
           data: 'custom',
           pipes: [],
@@ -190,7 +194,7 @@ describe('RouterExecutionContext', () => {
       const expectedValues = [
         { index: 0, type: RouteParamtypes.REQUEST, data: 'test' },
         { index: 2, type: RouteParamtypes.BODY, data: 'test' },
-        { index: 3, type: `key${CUSTOM_ROUTE_AGRS_METADATA}`, data: 'custom' },
+        { index: 3, type: `key${CUSTOM_ROUTE_ARGS_METADATA}`, data: 'custom' },
       ];
       expect(values[0]).to.deep.include(expectedValues[0]);
       expect(values[1]).to.deep.include(expectedValues[1]);
@@ -259,6 +263,8 @@ describe('RouterExecutionContext', () => {
         expect(contextCreator.isPipeable(RouteParamtypes.BODY)).to.be.true;
         expect(contextCreator.isPipeable(RouteParamtypes.QUERY)).to.be.true;
         expect(contextCreator.isPipeable(RouteParamtypes.PARAM)).to.be.true;
+        expect(contextCreator.isPipeable(RouteParamtypes.FILE)).to.be.true;
+        expect(contextCreator.isPipeable(RouteParamtypes.FILES)).to.be.true;
         expect(contextCreator.isPipeable('custom')).to.be.true;
       });
     });
@@ -313,7 +319,7 @@ describe('RouterExecutionContext', () => {
           true,
           undefined,
           200,
-        );
+        ) as HandlerResponseBasicFn;
         await handler(value, response);
 
         expect(response.render.calledWith(template, value)).to.be.true;
@@ -326,13 +332,14 @@ describe('RouterExecutionContext', () => {
 
         sinon.stub(contextCreator, 'reflectResponseHeaders').returns([]);
         sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
 
         const handler = contextCreator.createHandleResponseFn(
           null,
           true,
           undefined,
           200,
-        );
+        ) as HandlerResponseBasicFn;
         await handler(result, response);
 
         expect(response.render.called).to.be.false;
@@ -358,7 +365,7 @@ describe('RouterExecutionContext', () => {
           true,
           redirectResponse,
           200,
-        );
+        ) as HandlerResponseBasicFn;
         await handler(redirectResponse, response);
 
         expect(
@@ -377,13 +384,14 @@ describe('RouterExecutionContext', () => {
 
         sinon.stub(contextCreator, 'reflectResponseHeaders').returns([]);
         sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
 
         const handler = contextCreator.createHandleResponseFn(
           null,
           true,
           undefined,
           200,
-        );
+        ) as HandlerResponseBasicFn;
         await handler(result, response);
 
         expect(response.redirect.called).to.be.false;
@@ -396,13 +404,14 @@ describe('RouterExecutionContext', () => {
         const response = {};
 
         sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns(undefined);
 
         const handler = contextCreator.createHandleResponseFn(
           null,
           false,
           undefined,
           1234,
-        );
+        ) as HandlerResponseBasicFn;
         const adapterReplySpy = sinon.spy(adapter, 'reply');
         await handler(result, response);
         expect(
@@ -410,6 +419,87 @@ describe('RouterExecutionContext', () => {
             sinon.match.same(response),
             'test',
             1234,
+          ),
+        ).to.be.true;
+      });
+    });
+
+    describe('when "isSse" is enabled', () => {
+      it('should delegate result to SseStream', async () => {
+        const result = of('test');
+        const response = new PassThrough();
+        response.write = sinon.spy();
+
+        const request = new PassThrough();
+        request.on = sinon.spy();
+
+        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          null,
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        await handler(result, response, request);
+
+        expect((response.write as any).called).to.be.true;
+        expect((request.on as any).called).to.be.true;
+      });
+
+      it('should not allow a non-observable result', async () => {
+        const result = Promise.resolve('test');
+        const response = new PassThrough();
+        const request = new PassThrough();
+
+        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          null,
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+
+        try {
+          await handler(result, response, request);
+        } catch (e) {
+          expect(e.message).to.equal(
+            'You must return an Observable stream to use Server-Sent Events (SSE).',
+          );
+        }
+      });
+
+      it('should apply any headers that exists on the response', async () => {
+        const result = of('test');
+        const response = new PassThrough() as HeaderStream;
+        response.write = sinon.spy();
+        response.writeHead = sinon.spy();
+        response.flushHeaders = sinon.spy();
+        response.getHeaders = sinon
+          .stub()
+          .returns({ 'access-control-headers': 'some-cors-value' });
+
+        const request = new PassThrough();
+        request.on = sinon.spy();
+
+        sinon.stub(contextCreator, 'reflectRenderTemplate').returns(undefined);
+        sinon.stub(contextCreator, 'reflectSse').returns('/');
+
+        const handler = contextCreator.createHandleResponseFn(
+          null,
+          true,
+          undefined,
+          200,
+        ) as HandlerResponseBasicFn;
+        await handler(result, response, request);
+
+        expect(
+          (response.writeHead as sinon.SinonSpy).calledWith(
+            200,
+            sinon.match.hasNested('access-control-headers', 'some-cors-value'),
           ),
         ).to.be.true;
       });

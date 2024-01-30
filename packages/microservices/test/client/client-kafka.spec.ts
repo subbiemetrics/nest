@@ -3,7 +3,6 @@ import * as sinon from 'sinon';
 import { ClientKafka } from '../../client/client-kafka';
 import { NO_MESSAGE_HANDLER } from '../../constants';
 import { KafkaHeaders } from '../../enums';
-import { InvalidKafkaClientTopicPartitionException } from '../../errors/invalid-kafka-client-topic-partition.exception';
 import { InvalidKafkaClientTopicException } from '../../errors/invalid-kafka-client-topic.exception';
 import {
   ConsumerGroupJoinEvent,
@@ -12,7 +11,6 @@ import {
 } from '../../external/kafka.interface';
 
 describe('ClientKafka', () => {
-  // static
   const topic = 'test.topic';
   const partition = 0;
   const replyTopic = 'test.topic.reply';
@@ -23,8 +21,9 @@ describe('ClientKafka', () => {
   const timestamp = new Date().toISOString();
   const attributes = 1;
   const messageValue = 'test-message';
+  const heartbeat = async () => {};
+  const pause = () => () => {};
 
-  // message
   const message: KafkaMessage = {
     key: Buffer.from(key),
     offset,
@@ -34,7 +33,6 @@ describe('ClientKafka', () => {
     attributes,
   };
 
-  // deserialized message
   const deserializedMessage: any = {
     key,
     offset,
@@ -46,7 +44,6 @@ describe('ClientKafka', () => {
     partition,
   };
 
-  // payloads
   const payload: EachMessagePayload = {
     topic,
     partition,
@@ -58,6 +55,8 @@ describe('ClientKafka', () => {
       },
       message,
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadDisposed: EachMessagePayload = {
@@ -73,9 +72,11 @@ describe('ClientKafka', () => {
       message,
       {
         size: 0,
-        value: { test: true },
+        value: Buffer.from(JSON.stringify({ test: true })),
       },
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadError: EachMessagePayload = {
@@ -94,6 +95,8 @@ describe('ClientKafka', () => {
         value: null,
       },
     ),
+    heartbeat,
+    pause,
   };
 
   const payloadWithoutCorrelation: EachMessagePayload = {
@@ -105,6 +108,8 @@ describe('ClientKafka', () => {
       },
       message,
     ),
+    heartbeat,
+    pause,
   };
 
   // deserialized payload
@@ -119,6 +124,8 @@ describe('ClientKafka', () => {
       },
       deserializedMessage,
     ),
+    heartbeat,
+    pause,
   };
 
   const deserializedPayloadDisposed: EachMessagePayload = {
@@ -137,24 +144,8 @@ describe('ClientKafka', () => {
         value: { test: true },
       },
     ),
-  };
-
-  const deserializedPayloadError: EachMessagePayload = {
-    topic,
-    partition,
-    message: Object.assign(
-      {
-        headers: {
-          [KafkaHeaders.CORRELATION_ID]: correlationId,
-          [KafkaHeaders.NEST_ERR]: NO_MESSAGE_HANDLER,
-        },
-      },
-      deserializedMessage,
-      {
-        size: 0,
-        value: null,
-      },
-    ),
+    heartbeat,
+    pause,
   };
 
   let client: ClientKafka;
@@ -167,7 +158,7 @@ describe('ClientKafka', () => {
   let consumerStub: sinon.SinonStub;
   let producerStub: sinon.SinonStub;
   let createClientStub: sinon.SinonStub;
-  let kafkaClient;
+  let kafkaClient: any;
 
   beforeEach(() => {
     client = new ClientKafka({});
@@ -205,6 +196,30 @@ describe('ClientKafka', () => {
       .callsFake(() => kafkaClient);
   });
 
+  describe('createClient', () => {
+    beforeEach(() => {
+      client = new ClientKafka({});
+    });
+
+    it(`should accept a custom logCreator in client options`, () => {
+      const logCreatorSpy = sinon.spy(() => 'test');
+      const logCreator = () => logCreatorSpy;
+
+      client = new ClientKafka({
+        client: {
+          brokers: [],
+          logCreator,
+        },
+      });
+
+      const logger = client.createClient().logger();
+
+      logger.info({ namespace: '', level: 1, log: 'test' });
+
+      expect(logCreatorSpy.called).to.be.true;
+    });
+  });
+
   describe('subscribeToResponseOf', () => {
     let normalizePatternSpy: sinon.SinonSpy;
     let getResponsePatternNameSpy: sinon.SinonSpy;
@@ -232,14 +247,14 @@ describe('ClientKafka', () => {
   });
 
   describe('close', () => {
-    const consumer = { disconnect: sinon.spy() };
-    const producer = { disconnect: sinon.spy() };
+    const consumer = { disconnect: sinon.stub().resolves() };
+    const producer = { disconnect: sinon.stub().resolves() };
     beforeEach(() => {
       (client as any).consumer = consumer;
       (client as any).producer = producer;
     });
-    it('should close server', () => {
-      client.close();
+    it('should close server', async () => {
+      await client.close();
 
       expect(consumer.disconnect.calledOnce).to.be.true;
       expect(producer.disconnect.calledOnce).to.be.true;
@@ -254,46 +269,97 @@ describe('ClientKafka', () => {
     let bindTopicsStub: sinon.SinonStub;
     // let handleErrorsSpy: sinon.SinonSpy;
 
-    beforeEach(() => {
-      consumerAssignmentsStub = sinon.stub(
-        client as any,
-        'consumerAssignments',
-      );
-      bindTopicsStub = sinon
-        .stub(client, 'bindTopics')
-        .callsFake(async () => {});
+    describe('consumer and producer', () => {
+      beforeEach(() => {
+        consumerAssignmentsStub = sinon.stub(
+          client as any,
+          'consumerAssignments',
+        );
+        bindTopicsStub = sinon
+          .stub(client, 'bindTopics')
+          .callsFake(async () => {});
+      });
+
+      it('should expect the connection to be created', async () => {
+        const connection = await client.connect();
+
+        expect(createClientStub.calledOnce).to.be.true;
+        expect(producerStub.calledOnce).to.be.true;
+
+        expect(consumerStub.calledOnce).to.be.true;
+
+        expect(on.calledOnce).to.be.true;
+        expect(client['consumerAssignments']).to.be.empty;
+
+        expect(connect.calledTwice).to.be.true;
+
+        expect(bindTopicsStub.calledOnce).to.be.true;
+        expect(connection).to.deep.equal(producerStub());
+      });
+
+      it('should expect the connection to be reused', async () => {
+        (client as any).initialized = Promise.resolve({});
+
+        await client.connect();
+
+        expect(createClientStub.calledOnce).to.be.false;
+        expect(producerStub.calledOnce).to.be.false;
+        expect(consumerStub.calledOnce).to.be.false;
+
+        expect(on.calledOnce).to.be.false;
+        expect(client['consumerAssignments']).to.be.empty;
+
+        expect(connect.calledTwice).to.be.false;
+
+        expect(bindTopicsStub.calledOnce).to.be.false;
+      });
     });
 
-    it('should expect the connection to be created', async () => {
-      const connection = await client.connect();
+    describe('producer only mode', () => {
+      beforeEach(() => {
+        consumerAssignmentsStub = sinon.stub(
+          client as any,
+          'consumerAssignments',
+        );
+        bindTopicsStub = sinon
+          .stub(client, 'bindTopics')
+          .callsFake(async () => {});
+        client['producerOnlyMode'] = true;
+      });
 
-      expect(createClientStub.calledOnce).to.be.true;
-      expect(producerStub.calledOnce).to.be.true;
-      expect(consumerStub.calledOnce).to.be.true;
+      it('should expect the connection to be created', async () => {
+        const connection = await client.connect();
 
-      expect(on.calledOnce).to.be.true;
-      expect(client['consumerAssignments']).to.be.empty;
+        expect(createClientStub.calledOnce).to.be.true;
+        expect(producerStub.calledOnce).to.be.true;
 
-      expect(connect.calledTwice).to.be.true;
+        expect(consumerStub.calledOnce).to.be.false;
 
-      expect(bindTopicsStub.calledOnce).to.be.true;
-      expect(connection).to.deep.equal(producerStub());
-    });
+        expect(on.calledOnce).to.be.false;
+        expect(client['consumerAssignments']).to.be.empty;
 
-    it('should expect the connection to be reused', async () => {
-      (client as any).client = kafkaClient;
-      await client.connect();
+        expect(connect.calledOnce).to.be.true;
 
-      expect(createClientStub.calledOnce).to.be.false;
-      expect(producerStub.calledOnce).to.be.false;
-      expect(consumerStub.calledOnce).to.be.false;
+        expect(bindTopicsStub.calledOnce).to.be.false;
+        expect(connection).to.deep.equal(producerStub());
+      });
 
-      expect(on.calledOnce).to.be.false;
-      expect(client['consumerAssignments']).to.be.empty;
+      it('should expect the connection to be reused', async () => {
+        (client as any).initialized = Promise.resolve({});
 
-      expect(connect.calledTwice).to.be.false;
+        await client.connect();
 
-      expect(bindTopicsStub.calledOnce).to.be.false;
+        expect(createClientStub.calledOnce).to.be.false;
+        expect(producerStub.calledOnce).to.be.false;
+        expect(consumerStub.calledOnce).to.be.false;
+
+        expect(on.calledOnce).to.be.false;
+        expect(client['consumerAssignments']).to.be.empty;
+
+        expect(connect.calledTwice).to.be.false;
+
+        expect(bindTopicsStub.calledOnce).to.be.false;
+      });
     });
   });
 
@@ -314,14 +380,48 @@ describe('ClientKafka', () => {
           memberId: 'member-1',
           memberAssignment: {
             'topic-a': [0, 1, 2],
+            'topic-b': [3, 4, 5],
           },
         },
       };
 
       client['setConsumerAssignments'](consumerAssignments);
+
       expect(client['consumerAssignments']).to.deep.eq(
-        consumerAssignments.payload.memberAssignment,
+        // consumerAssignments.payload.memberAssignment,
+        {
+          'topic-a': 0,
+          'topic-b': 3,
+        },
       );
+    });
+
+    it('should not update consumer assignments if there are no partitions assigned to consumer', async () => {
+      await client.connect();
+
+      const consumerAssignments: ConsumerGroupJoinEvent = {
+        id: 'id',
+        type: 'type',
+        timestamp: 1234567890,
+        payload: {
+          duration: 20,
+          groupId: 'group-id',
+          isLeader: true,
+          leaderId: 'member-1',
+          groupProtocol: 'RoundRobin',
+          memberId: 'member-1',
+          memberAssignment: {
+            'topic-a': [],
+            'topic-b': [3, 4, 5],
+          },
+        },
+      };
+
+      client['setConsumerAssignments'](consumerAssignments);
+
+      expect(client['consumerAssignments']).to.deep.eq({
+        'topic-b': 3,
+      });
     });
   });
 
@@ -335,7 +435,7 @@ describe('ClientKafka', () => {
       expect(subscribe.calledOnce).to.be.true;
       expect(
         subscribe.calledWith({
-          topic: replyTopic,
+          topics: [replyTopic],
         }),
       ).to.be.true;
       expect(run.calledOnce).to.be.true;
@@ -352,7 +452,7 @@ describe('ClientKafka', () => {
       expect(subscribe.calledOnce).to.be.true;
       expect(
         subscribe.calledWith({
-          topic: replyTopic,
+          topics: [replyTopic],
           fromBeginning: true,
         }),
       ).to.be.true;
@@ -394,7 +494,7 @@ describe('ClientKafka', () => {
         expect(
           callback.calledWith({
             isDisposed: true,
-            response: payloadDisposed.message.value,
+            response: deserializedPayloadDisposed.message.value,
             err: undefined,
           }),
         ).to.be.true;
@@ -493,10 +593,22 @@ describe('ClientKafka', () => {
     });
   });
 
+  describe('getConsumerAssignments', () => {
+    it('should get consumer assignments', () => {
+      client['consumerAssignments'] = {
+        [replyTopic]: 0,
+      };
+
+      const result = client.getConsumerAssignments();
+
+      expect(result).to.deep.eq(client['consumerAssignments']);
+    });
+  });
+
   describe('getReplyTopicPartition', () => {
     it('should get reply partition', () => {
       client['consumerAssignments'] = {
-        [replyTopic]: [0],
+        [replyTopic]: 0,
       };
 
       const result = client['getReplyTopicPartition'](replyTopic);
@@ -504,19 +616,17 @@ describe('ClientKafka', () => {
       expect(result).to.eq('0');
     });
 
-    it('should throw error when the topic is being consumed but is not assigned partitions', () => {
-      client['consumerAssignments'] = {
-        [replyTopic]: [],
-      };
+    it('should throw error when the topic is not being consumed', () => {
+      client['consumerAssignments'] = {};
 
       expect(() => client['getReplyTopicPartition'](replyTopic)).to.throw(
-        InvalidKafkaClientTopicPartitionException,
+        InvalidKafkaClientTopicException,
       );
     });
 
-    it('should throw error when the topic is not being consumer', () => {
+    it('should throw error when the topic is not being consumed', () => {
       client['consumerAssignments'] = {
-        [topic]: [],
+        [topic]: undefined,
       };
 
       expect(() => client['getReplyTopicPartition'](replyTopic)).to.throw(
@@ -551,7 +661,7 @@ describe('ClientKafka', () => {
         'getReplyTopicPartition',
       );
       routingMapSetSpy = sinon.spy((client as any).routingMap, 'set');
-      sendSpy = sinon.spy();
+      sendSpy = sinon.spy(() => Promise.resolve());
 
       // stub
       assignPacketIdStub = sinon
@@ -568,7 +678,7 @@ describe('ClientKafka', () => {
 
       // set
       client['consumerAssignments'] = {
-        [replyTopic]: [parseFloat(replyPartition)],
+        [replyTopic]: parseFloat(replyPartition),
       };
     });
 
@@ -619,6 +729,12 @@ describe('ClientKafka', () => {
       );
     });
 
+    it('should remove callback from routing map when unsubscribe', async () => {
+      client['publish'](readPacket, callback)();
+      expect(client['routingMap'].has(correlationId)).to.be.false;
+      expect(client['routingMap'].size).to.eq(0);
+    });
+
     describe('on error', () => {
       let clientProducerStub: sinon.SinonStub;
       let sendStub: sinon.SinonStub;
@@ -638,10 +754,11 @@ describe('ClientKafka', () => {
       });
 
       it('should call callback', async () => {
-        await client['publish'](readPacket, callback);
-
-        expect(callback.called).to.be.true;
-        expect(callback.getCall(0).args[0].err).to.be.instanceof(Error);
+        return new Promise(async resolve => {
+          return client['publish'](readPacket, ({ err }) => resolve(err));
+        }).then(err => {
+          expect(err).to.be.instanceof(Error);
+        });
       });
     });
 

@@ -1,4 +1,8 @@
-import { DynamicModule, Type } from '@nestjs/common/interfaces';
+import {
+  DynamicModule,
+  ForwardReference,
+  Type,
+} from '@nestjs/common/interfaces';
 import { ModuleTokenFactory } from './module-token-factory';
 
 export interface ModuleFactory {
@@ -13,27 +17,30 @@ export class ModuleCompiler {
   public async compile(
     metatype: Type<any> | DynamicModule | Promise<DynamicModule>,
   ): Promise<ModuleFactory> {
-    const { type, dynamicMetadata } = await this.extractMetadata(metatype);
+    const { type, dynamicMetadata } = this.extractMetadata(await metatype);
     const token = this.moduleTokenFactory.create(type, dynamicMetadata);
     return { type, dynamicMetadata, token };
   }
 
-  public async extractMetadata(
-    metatype: Type<any> | DynamicModule | Promise<DynamicModule>,
-  ): Promise<{
+  public extractMetadata(
+    metatype: Type<any> | ForwardReference | DynamicModule,
+  ): {
     type: Type<any>;
     dynamicMetadata?: Partial<DynamicModule> | undefined;
-  }> {
-    metatype = await metatype;
+  } {
     if (!this.isDynamicModule(metatype)) {
-      return { type: metatype };
+      return {
+        type: (metatype as ForwardReference)?.forwardRef
+          ? (metatype as ForwardReference).forwardRef()
+          : metatype,
+      };
     }
     const { module: type, ...dynamicMetadata } = metatype;
     return { type, dynamicMetadata };
   }
 
   public isDynamicModule(
-    module: Type<any> | DynamicModule,
+    module: Type<any> | DynamicModule | ForwardReference,
   ): module is DynamicModule {
     return !!(module as DynamicModule).module;
   }

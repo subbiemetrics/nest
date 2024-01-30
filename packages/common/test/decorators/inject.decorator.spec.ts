@@ -16,10 +16,20 @@ describe('@Inject', () => {
     const metadata = Reflect.getMetadata(SELF_DECLARED_DEPS_METADATA, Test);
 
     const expectedMetadata = [
-      { index: 2, param: opaqueToken.name },
+      { index: 2, param: opaqueToken },
       { index: 1, param: 'test2' },
       { index: 0, param: 'test' },
     ];
     expect(metadata).to.be.eql(expectedMetadata);
+  });
+
+  it('should throw an error when token is undefined', () => {
+    const defineInvalidClass = () => {
+      class Test {
+        constructor(@Inject(undefined) invalidParam) {}
+      }
+    };
+
+    expect(defineInvalidClass).to.throw(/^Token is undefined/);
   });
 });

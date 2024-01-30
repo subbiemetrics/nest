@@ -29,14 +29,14 @@ export const RequestMapping = (
   };
 };
 
-const createMappingDecorator = (method: RequestMethod) => (
-  path?: string | string[],
-): MethodDecorator => {
-  return RequestMapping({
-    [PATH_METADATA]: path,
-    [METHOD_METADATA]: method,
-  });
-};
+const createMappingDecorator =
+  (method: RequestMethod) =>
+  (path?: string | string[]): MethodDecorator => {
+    return RequestMapping({
+      [PATH_METADATA]: path,
+      [METHOD_METADATA]: method,
+    });
+  };
 
 /**
  * Route handler (method) Decorator. Routes HTTP POST requests to the specified path.
@@ -109,3 +109,12 @@ export const Head = createMappingDecorator(RequestMethod.HEAD);
  * @publicApi
  */
 export const All = createMappingDecorator(RequestMethod.ALL);
+
+/**
+ * Route handler (method) Decorator. Routes HTTP SEARCH requests to the specified path.
+ *
+ * @see [Routing](https://docs.nestjs.com/controllers#routing)
+ *
+ * @publicApi
+ */
+export const Search = createMappingDecorator(RequestMethod.SEARCH);

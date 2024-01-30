@@ -1,7 +1,7 @@
 import * as request from 'supertest';
 import { Test } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import { ApplicationModule } from '../src/app.module';
+import { AppModule } from '../src/app.module';
 
 describe('Hello world (default adapter)', () => {
   let server;
@@ -9,7 +9,7 @@ describe('Hello world (default adapter)', () => {
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      imports: [ApplicationModule],
+      imports: [AppModule],
     }).compile();
 
     app = module.createNestApplication();
@@ -26,6 +26,16 @@ describe('Hello world (default adapter)', () => {
     {
       host: 'acme.example.com',
       path: '/host',
+      greeting: 'Host Greeting! tenant=acme',
+    },
+    {
+      host: 'acme.example1.com',
+      path: '/host-array',
+      greeting: 'Host Greeting! tenant=acme',
+    },
+    {
+      host: 'acme.example2.com',
+      path: '/host-array',
       greeting: 'Host Greeting! tenant=acme',
     },
   ].forEach(({ host, path, greeting }) => {

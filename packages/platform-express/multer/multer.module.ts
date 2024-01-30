@@ -8,13 +8,16 @@ import {
 } from './interfaces/files-upload-module.interface';
 import { MULTER_MODULE_ID } from './multer.constants';
 
+/**
+ * @publicApi
+ */
 @Module({})
 export class MulterModule {
   static register(options: MulterModuleOptions = {}): DynamicModule {
     return {
       module: MulterModule,
       providers: [
-        { provide: MULTER_MODULE_OPTIONS, useValue: options },
+        { provide: MULTER_MODULE_OPTIONS, useFactory: () => options },
         {
           provide: MULTER_MODULE_ID,
           useValue: randomStringGenerator(),

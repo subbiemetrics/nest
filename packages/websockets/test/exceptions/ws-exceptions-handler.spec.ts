@@ -66,13 +66,13 @@ describe('WsExceptionsHandler', () => {
       handler.setCustomFilters(filters as any);
       expect((handler as any).filters).to.be.eql(filters);
     });
-    it('should throws exception when passed argument is not an array', () => {
+    it('should throw exception when passed argument is not an array', () => {
       expect(() => handler.setCustomFilters(null)).to.throw();
     });
   });
   describe('invokeCustomFilters', () => {
     describe('when filters array is empty', () => {
-      it('should returns false', () => {
+      it('should return false', () => {
         expect(handler.invokeCustomFilters(null, null)).to.be.false;
       });
     });
@@ -99,7 +99,7 @@ describe('WsExceptionsHandler', () => {
           handler.invokeCustomFilters(exception, res as any);
           expect(funcSpy.calledWith(exception, res)).to.be.true;
         });
-        it('should returns true', () => {
+        it('should return true', () => {
           expect(handler.invokeCustomFilters(new TestException(), null)).to.be
             .true;
         });
@@ -109,7 +109,7 @@ describe('WsExceptionsHandler', () => {
           handler.invokeCustomFilters(new TestException(), null);
           expect(funcSpy.notCalled).to.be.true;
         });
-        it('should returns false', () => {
+        it('should return false', () => {
           expect(handler.invokeCustomFilters(new TestException(), null)).to.be
             .false;
         });

@@ -1,74 +1,181 @@
-import { RequestMethod } from '@nestjs/common';
-import { PATH_METADATA } from '@nestjs/common/constants';
-import { RouteInfo, Type } from '@nestjs/common/interfaces';
 import {
+  MODULE_PATH,
+  PATH_METADATA,
+  VERSION_METADATA,
+} from '@nestjs/common/constants';
+import {
+  RouteInfo,
+  Type,
+  VERSION_NEUTRAL,
+  VersionValue,
+} from '@nestjs/common/interfaces';
+import {
+  addLeadingSlash,
   isString,
   isUndefined,
-  validatePath,
 } from '@nestjs/common/utils/shared.utils';
+import { ApplicationConfig } from '../application-config';
 import { NestContainer } from '../injector/container';
+import { Module } from '../injector/module';
 import { MetadataScanner } from '../metadata-scanner';
-import { RouterExplorer } from '../router/router-explorer';
+import { PathsExplorer, RouteDefinition } from '../router/paths-explorer';
+import { targetModulesByContainer } from '../router/router-module';
 
 export class RoutesMapper {
-  private readonly routerExplorer: RouterExplorer;
+  private readonly pathsExplorer: PathsExplorer;
 
-  constructor(container: NestContainer) {
-    this.routerExplorer = new RouterExplorer(new MetadataScanner(), container);
+  constructor(
+    private readonly container: NestContainer,
+    private readonly applicationConfig: ApplicationConfig,
+  ) {
+    this.pathsExplorer = new PathsExplorer(new MetadataScanner());
   }
 
   public mapRouteToRouteInfo(
-    route: Type<any> | RouteInfo | string,
+    controllerOrRoute: Type<any> | RouteInfo | string,
   ): RouteInfo[] {
-    if (isString(route)) {
-      return [
-        {
-          path: this.validateRoutePath(route),
-          method: RequestMethod.ALL,
-        },
-      ];
+    if (isString(controllerOrRoute)) {
+      return this.getRouteInfoFromPath(controllerOrRoute);
     }
-    const routePath: string = Reflect.getMetadata(PATH_METADATA, route);
-    if (this.isRouteInfo(routePath, route)) {
-      return [
-        {
-          path: this.validateRoutePath(route.path),
-          method: route.method,
-        },
-      ];
+    const routePathOrPaths = this.getRoutePath(controllerOrRoute);
+    if (this.isRouteInfo(routePathOrPaths, controllerOrRoute)) {
+      return this.getRouteInfoFromObject(controllerOrRoute);
     }
-    const paths = this.routerExplorer.scanForPaths(
-      Object.create(route),
-      route.prototype,
+
+    return this.getRouteInfoFromController(controllerOrRoute, routePathOrPaths);
+  }
+
+  private getRouteInfoFromPath(routePath: string): RouteInfo[] {
+    const defaultRequestMethod = -1;
+    return [
+      {
+        path: addLeadingSlash(routePath),
+        method: defaultRequestMethod as any,
+      },
+    ];
+  }
+
+  private getRouteInfoFromObject(routeInfoObject: RouteInfo): RouteInfo[] {
+    const routeInfo: RouteInfo = {
+      path: addLeadingSlash(routeInfoObject.path),
+      method: routeInfoObject.method,
+    };
+
+    if (routeInfoObject.version) {
+      routeInfo.version = routeInfoObject.version;
+    }
+    return [routeInfo];
+  }
+
+  private getRouteInfoFromController(
+    controller: Type<any>,
+    routePath: string,
+  ): RouteInfo[] {
+    const controllerPaths = this.pathsExplorer.scanForPaths(
+      Object.create(controller),
+      controller.prototype,
     );
+    const controllerVersion = this.getVersionMetadata(controller);
+    const versioningConfig = this.applicationConfig.getVersioning();
+    const moduleRef = this.getHostModuleOfController(controller);
+    const modulePath = this.getModulePath(moduleRef?.metatype);
+
     const concatPaths = <T>(acc: T[], currentValue: T[]) =>
       acc.concat(currentValue);
-    return paths
-      .map(
-        item =>
-          item.path &&
-          item.path.map(p => ({
-            path:
-              this.validateGlobalPath(routePath) + this.validateRoutePath(p),
-            method: item.requestMethod,
-          })),
+
+    const toUndefinedIfNeural = (version: VersionValue) =>
+      version === VERSION_NEUTRAL ? undefined : version;
+
+    const toRouteInfo = (item: RouteDefinition, prefix: string) =>
+      item.path?.flatMap(p => {
+        let endpointPath = modulePath ?? '';
+        endpointPath += this.normalizeGlobalPath(prefix) + addLeadingSlash(p);
+
+        const routeInfo: RouteInfo = {
+          path: endpointPath,
+          method: item.requestMethod,
+        };
+        const version = item.version ?? controllerVersion;
+        if (version && versioningConfig) {
+          if (typeof version !== 'string' && Array.isArray(version)) {
+            return version.map(v => ({
+              ...routeInfo,
+              version: toUndefinedIfNeural(v),
+            }));
+          }
+          routeInfo.version = toUndefinedIfNeural(version);
+        }
+
+        return routeInfo;
+      });
+
+    return []
+      .concat(routePath)
+      .map(routePath =>
+        controllerPaths
+          .map(item => toRouteInfo(item, routePath))
+          .reduce(concatPaths, []),
       )
       .reduce(concatPaths, []);
   }
 
   private isRouteInfo(
-    path: string | undefined,
+    path: string | string[] | undefined,
     objectOrClass: Function | RouteInfo,
   ): objectOrClass is RouteInfo {
     return isUndefined(path);
   }
 
-  private validateGlobalPath(path: string): string {
-    const prefix = validatePath(path);
+  private normalizeGlobalPath(path: string): string {
+    const prefix = addLeadingSlash(path);
     return prefix === '/' ? '' : prefix;
   }
 
-  private validateRoutePath(path: string): string {
-    return validatePath(path);
+  private getRoutePath(route: Type<any> | RouteInfo): string | undefined {
+    return Reflect.getMetadata(PATH_METADATA, route);
+  }
+
+  private getHostModuleOfController(
+    metatype: Type<unknown>,
+  ): Module | undefined {
+    if (!metatype) {
+      return;
+    }
+    const modulesContainer = this.container.getModules();
+    const moduleRefsSet = targetModulesByContainer.get(modulesContainer);
+    if (!moduleRefsSet) {
+      return;
+    }
+
+    const modules = Array.from(modulesContainer.values()).filter(moduleRef =>
+      moduleRefsSet.has(moduleRef),
+    );
+    return modules.find(({ controllers }) => controllers.has(metatype));
+  }
+
+  private getModulePath(
+    metatype: Type<unknown> | undefined,
+  ): string | undefined {
+    if (!metatype) {
+      return;
+    }
+    const modulesContainer = this.container.getModules();
+    const modulePath = Reflect.getMetadata(
+      MODULE_PATH + modulesContainer.applicationId,
+      metatype,
+    );
+    return modulePath ?? Reflect.getMetadata(MODULE_PATH, metatype);
+  }
+
+  private getVersionMetadata(
+    metatype: Type<unknown> | Function,
+  ): VersionValue | undefined {
+    const versioningConfig = this.applicationConfig.getVersioning();
+    if (versioningConfig) {
+      return (
+        Reflect.getMetadata(VERSION_METADATA, metatype) ??
+        versioningConfig.defaultVersion
+      );
+    }
   }
 }

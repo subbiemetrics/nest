@@ -7,13 +7,26 @@ import {
   NestHybridApplicationOptions,
   NestInterceptor,
   PipeTransform,
+  VersioningOptions,
+  VersioningType,
   WebSocketAdapter,
 } from '@nestjs/common';
-import { CorsOptions } from '@nestjs/common/interfaces/external/cors-options.interface';
-import { NestApplicationOptions } from '@nestjs/common/interfaces/nest-application-options.interface';
+import {
+  GlobalPrefixOptions,
+  NestApplicationOptions,
+} from '@nestjs/common/interfaces';
+import {
+  CorsOptions,
+  CorsOptionsDelegate,
+} from '@nestjs/common/interfaces/external/cors-options.interface';
 import { Logger } from '@nestjs/common/services/logger.service';
 import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { isObject, validatePath } from '@nestjs/common/utils/shared.utils';
+import {
+  addLeadingSlash,
+  isFunction,
+  isObject,
+  isString,
+} from '@nestjs/common/utils/shared.utils';
 import { iterate } from 'iterare';
 import { platform } from 'os';
 import { AbstractHttpAdapter } from './adapters';
@@ -21,8 +34,11 @@ import { ApplicationConfig } from './application-config';
 import { MESSAGES } from './constants';
 import { optionalRequire } from './helpers/optional-require';
 import { NestContainer } from './injector/container';
+import { Injector } from './injector/injector';
+import { GraphInspector } from './inspector/graph-inspector';
 import { MiddlewareContainer } from './middleware/container';
 import { MiddlewareModule } from './middleware/middleware-module';
+import { mapToExcludeRoute } from './middleware/utils';
 import { NestApplicationContext } from './nest-application-context';
 import { Resolver } from './router/interfaces/resolver.interface';
 import { RoutesResolver } from './router/routes-resolver';
@@ -31,19 +47,22 @@ const { SocketModule } = optionalRequire(
   '@nestjs/websockets/socket-module',
   () => require('@nestjs/websockets/socket-module'),
 );
-const {
-  MicroservicesModule,
-} = optionalRequire('@nestjs/microservices/microservices-module', () =>
-  require('@nestjs/microservices/microservices-module'),
+const { MicroservicesModule } = optionalRequire(
+  '@nestjs/microservices/microservices-module',
+  () => require('@nestjs/microservices/microservices-module'),
 );
 
 /**
  * @publicApi
  */
-export class NestApplication extends NestApplicationContext
-  implements INestApplication {
-  private readonly logger = new Logger(NestApplication.name, true);
-  private readonly middlewareModule = new MiddlewareModule();
+export class NestApplication
+  extends NestApplicationContext<NestApplicationOptions>
+  implements INestApplication
+{
+  protected readonly logger = new Logger(NestApplication.name, {
+    timestamp: true,
+  });
+  private readonly middlewareModule: MiddlewareModule;
   private readonly middlewareContainer = new MiddlewareContainer(
     this.container,
   );
@@ -59,22 +78,26 @@ export class NestApplication extends NestApplicationContext
     container: NestContainer,
     private readonly httpAdapter: HttpServer,
     private readonly config: ApplicationConfig,
-    private readonly appOptions: NestApplicationOptions = {},
+    private readonly graphInspector: GraphInspector,
+    appOptions: NestApplicationOptions = {},
   ) {
-    super(container);
+    super(container, appOptions);
 
     this.selectContextModule();
     this.registerHttpServer();
-
+    this.injector = new Injector({ preview: this.appOptions.preview });
+    this.middlewareModule = new MiddlewareModule();
     this.routesResolver = new RoutesResolver(
       this.container,
       this.config,
       this.injector,
+      this.graphInspector,
     );
   }
 
   protected async dispose(): Promise<void> {
     this.socketModule && (await this.socketModule.close());
+    this.microservicesModule && (await this.microservicesModule.close());
     this.httpAdapter && (await this.httpAdapter.close());
 
     await Promise.all(
@@ -101,11 +124,14 @@ export class NestApplication extends NestApplicationContext
     if (!this.appOptions || !this.appOptions.cors) {
       return undefined;
     }
-    const isCorsOptionsObj = isObject(this.appOptions.cors);
-    if (!isCorsOptionsObj) {
+    const passCustomOptions =
+      isObject(this.appOptions.cors) || isFunction(this.appOptions.cors);
+    if (!passCustomOptions) {
       return this.enableCors();
     }
-    return this.enableCors(this.appOptions.cors as CorsOptions);
+    return this.enableCors(
+      this.appOptions.cors as CorsOptions | CorsOptionsDelegate<any>,
+    );
   }
 
   public createServer<T = any>(): T {
@@ -117,15 +143,23 @@ export class NestApplication extends NestApplicationContext
     this.registerWsModule();
 
     if (this.microservicesModule) {
-      this.microservicesModule.register(this.container, this.config);
+      this.microservicesModule.register(
+        this.container,
+        this.graphInspector,
+        this.config,
+        this.appOptions,
+      );
       this.microservicesModule.setupClients(this.container);
     }
+
     await this.middlewareModule.register(
       this.middlewareContainer,
       this.container,
       this.config,
       this.injector,
       this.httpAdapter,
+      this.graphInspector,
+      this.appOptions,
     );
   }
 
@@ -133,10 +167,20 @@ export class NestApplication extends NestApplicationContext
     if (!this.socketModule) {
       return;
     }
-    this.socketModule.register(this.container, this.config, this.httpServer);
+    this.socketModule.register(
+      this.container,
+      this.config,
+      this.graphInspector,
+      this.appOptions,
+      this.httpServer,
+    );
   }
 
   public async init(): Promise<this> {
+    if (this.isInitialized) {
+      return this;
+    }
+
     this.applyOptions();
     await this.httpAdapter?.init();
 
@@ -156,14 +200,16 @@ export class NestApplication extends NestApplicationContext
   }
 
   public registerParserMiddleware() {
-    this.httpAdapter.registerParserMiddleware();
+    const prefix = this.config.getGlobalPrefix();
+    const rawBody = !!this.appOptions?.rawBody;
+    this.httpAdapter.registerParserMiddleware(prefix, rawBody);
   }
 
   public async registerRouter() {
     await this.registerMiddleware(this.httpAdapter);
 
     const prefix = this.config.getGlobalPrefix();
-    const basePath = validatePath(prefix);
+    const basePath = addLeadingSlash(prefix);
     this.routesResolver.resolve(this.httpAdapter, basePath);
   }
 
@@ -189,6 +235,7 @@ export class NestApplication extends NestApplicationContext
     const instance = new NestMicroservice(
       this.container,
       microserviceOptions,
+      this.graphInspector,
       applicationConfig,
     );
     instance.registerListeners();
@@ -207,15 +254,10 @@ export class NestApplication extends NestApplicationContext
     return this.httpServer;
   }
 
-  public startAllMicroservices(callback?: () => void): this {
-    Promise.all(this.microservices.map(this.listenToPromise)).then(
-      () => callback && callback(),
-    );
+  public async startAllMicroservices(): Promise<this> {
+    this.assertNotInPreviewMode('startAllMicroservices');
+    await Promise.all(this.microservices.map(msvc => msvc.listen()));
     return this;
-  }
-
-  public startAllMicroservicesAsync(): Promise<void> {
-    return new Promise(resolve => this.startAllMicroservices(resolve));
   }
 
   public use(...args: [any, any?]): this {
@@ -223,29 +265,71 @@ export class NestApplication extends NestApplicationContext
     return this;
   }
 
-  public enableCors(options?: CorsOptions): void {
+  public useBodyParser(...args: [any, any?]): this {
+    if (!('useBodyParser' in this.httpAdapter)) {
+      this.logger.warn('Your HTTP Adapter does not support `.useBodyParser`.');
+      return this;
+    }
+
+    const [parserType, ...otherArgs] = args;
+    const rawBody = !!this.appOptions.rawBody;
+
+    this.httpAdapter.useBodyParser(...[parserType, rawBody, ...otherArgs]);
+
+    return this;
+  }
+
+  public enableCors(options?: CorsOptions | CorsOptionsDelegate<any>): void {
     this.httpAdapter.enableCors(options);
   }
 
-  public async listen(
-    port: number | string,
-    callback?: () => void,
-  ): Promise<any>;
-  public async listen(
-    port: number | string,
-    hostname: string,
-    callback?: () => void,
-  ): Promise<any>;
-  public async listen(port: number | string, ...args: any[]): Promise<any> {
-    !this.isInitialized && (await this.init());
-    this.httpAdapter.listen(port, ...args);
-    this.isListening = true;
-    return this.httpServer;
+  public enableVersioning(
+    options: VersioningOptions = { type: VersioningType.URI },
+  ): this {
+    this.config.enableVersioning(options);
+    return this;
   }
 
-  public listenAsync(port: number | string, hostname?: string): Promise<any> {
-    return new Promise(resolve => {
-      const server: any = this.listen(port, hostname, () => resolve(server));
+  public async listen(port: number | string): Promise<any>;
+  public async listen(port: number | string, hostname: string): Promise<any>;
+  public async listen(port: number | string, ...args: any[]): Promise<any> {
+    this.assertNotInPreviewMode('listen');
+    !this.isInitialized && (await this.init());
+
+    return new Promise((resolve, reject) => {
+      const errorHandler = (e: any) => {
+        this.logger.error(e?.toString?.());
+        reject(e);
+      };
+      this.httpServer.once('error', errorHandler);
+
+      const isCallbackInOriginalArgs = isFunction(args[args.length - 1]);
+      const listenFnArgs = isCallbackInOriginalArgs
+        ? args.slice(0, args.length - 1)
+        : args;
+
+      this.httpAdapter.listen(
+        port,
+        ...listenFnArgs,
+        (...originalCallbackArgs: unknown[]) => {
+          if (this.appOptions?.autoFlushLogs ?? true) {
+            this.flushLogs();
+          }
+          if (originalCallbackArgs[0] instanceof Error) {
+            return reject(originalCallbackArgs[0]);
+          }
+
+          const address = this.httpServer.address();
+          if (address) {
+            this.httpServer.removeListener('error', errorHandler);
+            this.isListening = true;
+            resolve(this.httpServer);
+          }
+          if (isCallbackInOriginalArgs) {
+            args[args.length - 1](...originalCallbackArgs);
+          }
+        },
+      );
     });
   }
 
@@ -254,33 +338,47 @@ export class NestApplication extends NestApplicationContext
       if (!this.isListening) {
         this.logger.error(MESSAGES.CALL_LISTEN_FIRST);
         reject(MESSAGES.CALL_LISTEN_FIRST);
+        return;
       }
-      this.httpServer.on('listening', () => {
-        const address = this.httpServer.address();
-        if (typeof address === 'string') {
-          if (platform() === 'win32') {
-            return address;
-          }
-          const basePath = encodeURIComponent(address);
-          return `${this.getProtocol()}+unix://${basePath}`;
-        }
-        let host = this.host();
-        if (address && address.family === 'IPv6') {
-          if (host === '::') {
-            host = '[::1]';
-          } else {
-            host = `[${host}]`;
-          }
-        } else if (host === '0.0.0.0') {
-          host = '127.0.0.1';
-        }
-        resolve(`${this.getProtocol()}://${host}:${address.port}`);
-      });
+      const address = this.httpServer.address();
+      resolve(this.formatAddress(address));
     });
   }
 
-  public setGlobalPrefix(prefix: string): this {
+  private formatAddress(address: any): string {
+    if (isString(address)) {
+      if (platform() === 'win32') {
+        return address;
+      }
+      const basePath = encodeURIComponent(address);
+      return `${this.getProtocol()}+unix://${basePath}`;
+    }
+
+    let host = this.host();
+    if (address && address.family === 'IPv6') {
+      if (host === '::') {
+        host = '[::1]';
+      } else {
+        host = `[${host}]`;
+      }
+    } else if (host === '0.0.0.0') {
+      host = '127.0.0.1';
+    }
+
+    return `${this.getProtocol()}://${host}:${address.port}`;
+  }
+
+  public setGlobalPrefix(prefix: string, options?: GlobalPrefixOptions): this {
     this.config.setGlobalPrefix(prefix);
+    if (options) {
+      const exclude = options?.exclude
+        ? mapToExcludeRoute(options.exclude)
+        : [];
+      this.config.setGlobalPrefixOptions({
+        ...options,
+        exclude,
+      });
+    }
     return this;
   }
 
@@ -291,21 +389,45 @@ export class NestApplication extends NestApplicationContext
 
   public useGlobalFilters(...filters: ExceptionFilter[]): this {
     this.config.useGlobalFilters(...filters);
+    filters.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'filter',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalPipes(...pipes: PipeTransform<any>[]): this {
     this.config.useGlobalPipes(...pipes);
+    pipes.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'pipe',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalInterceptors(...interceptors: NestInterceptor[]): this {
     this.config.useGlobalInterceptors(...interceptors);
+    interceptors.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'interceptor',
+        ref: item,
+      }),
+    );
     return this;
   }
 
   public useGlobalGuards(...guards: CanActivate[]): this {
     this.config.useGlobalGuards(...guards);
+    guards.forEach(item =>
+      this.graphInspector.insertOrphanedEnhancer({
+        subtype: 'guard',
+        ref: item,
+      }),
+    );
     return this;
   }
 
@@ -329,7 +451,7 @@ export class NestApplication extends NestApplicationContext
   }
   private host(): string | undefined {
     const address = this.httpServer.address();
-    if (typeof address === 'string') {
+    if (isString(address)) {
       return undefined;
     }
     return address && address.address;
@@ -344,11 +466,5 @@ export class NestApplication extends NestApplicationContext
       this.middlewareContainer,
       instance,
     );
-  }
-
-  private listenToPromise(microservice: INestMicroservice) {
-    return new Promise(async resolve => {
-      await microservice.listen(resolve);
-    });
   }
 }

@@ -1,15 +1,19 @@
 import { Logger } from '@nestjs/common/services/logger.service';
 import { isNil } from '@nestjs/common/utils/shared.utils';
-import { Observable } from 'rxjs';
+import { isObservable, lastValueFrom, Observable, ReplaySubject } from 'rxjs';
 import {
   KAFKA_DEFAULT_BROKER,
   KAFKA_DEFAULT_CLIENT,
   KAFKA_DEFAULT_GROUP,
+  NO_EVENT_HANDLER,
   NO_MESSAGE_HANDLER,
 } from '../constants';
 import { KafkaContext } from '../ctx-host';
+import { KafkaRequestDeserializer } from '../deserializers/kafka-request.deserializer';
 import { KafkaHeaders, Transport } from '../enums';
+import { KafkaRetriableException } from '../exceptions';
 import {
+  BrokersFunction,
   Consumer,
   ConsumerConfig,
   EachMessagePayload,
@@ -18,12 +22,14 @@ import {
   KafkaMessage,
   Message,
   Producer,
+  RecordMetadata,
 } from '../external/kafka.interface';
 import { KafkaLogger, KafkaParser } from '../helpers';
 import {
   CustomTransportStrategy,
   KafkaOptions,
   OutgoingResponse,
+  ReadPacket,
 } from '../interfaces';
 import { KafkaRequestSerializer } from '../serializers/kafka-request.serializer';
 import { Server } from './server';
@@ -37,43 +43,54 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
   protected client: Kafka = null;
   protected consumer: Consumer = null;
   protected producer: Producer = null;
+  protected parser: KafkaParser = null;
 
-  protected brokers: string[];
+  protected brokers: string[] | BrokersFunction;
   protected clientId: string;
   protected groupId: string;
 
-  constructor(private readonly options: KafkaOptions['options']) {
+  constructor(protected readonly options: KafkaOptions['options']) {
     super();
 
     const clientOptions =
       this.getOptionsProp(this.options, 'client') || ({} as KafkaConfig);
     const consumerOptions =
       this.getOptionsProp(this.options, 'consumer') || ({} as ConsumerConfig);
+    const postfixId =
+      this.getOptionsProp(this.options, 'postfixId') ?? '-server';
 
     this.brokers = clientOptions.brokers || [KAFKA_DEFAULT_BROKER];
 
     // append a unique id to the clientId and groupId
     // so they don't collide with a microservices client
     this.clientId =
-      (clientOptions.clientId || KAFKA_DEFAULT_CLIENT) + '-server';
-    this.groupId = (consumerOptions.groupId || KAFKA_DEFAULT_GROUP) + '-server';
+      (clientOptions.clientId || KAFKA_DEFAULT_CLIENT) + postfixId;
+    this.groupId = (consumerOptions.groupId || KAFKA_DEFAULT_GROUP) + postfixId;
 
     kafkaPackage = this.loadPackage('kafkajs', ServerKafka.name, () =>
       require('kafkajs'),
     );
 
+    this.parser = new KafkaParser((options && options.parser) || undefined);
+
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public async listen(callback: () => void): Promise<void> {
-    this.client = this.createClient();
-    await this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ): Promise<void> {
+    try {
+      this.client = this.createClient();
+      await this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
-  public close(): void {
-    this.consumer && this.consumer.disconnect();
-    this.producer && this.producer.disconnect();
+  public async close(): Promise<void> {
+    this.consumer && (await this.consumer.disconnect());
+    this.producer && (await this.producer.disconnect());
     this.consumer = null;
     this.producer = null;
     this.client = null;
@@ -94,23 +111,24 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
 
   public createClient<T = any>(): T {
     return new kafkaPackage.Kafka(
-      Object.assign(this.options.client || {}, {
-        clientId: this.clientId,
-        brokers: this.brokers,
-        logCreator: KafkaLogger.bind(null, this.logger),
-      }) as KafkaConfig,
+      Object.assign(
+        { logCreator: KafkaLogger.bind(null, this.logger) },
+        this.options.client,
+        { clientId: this.clientId, brokers: this.brokers },
+      ) as KafkaConfig,
     );
   }
 
   public async bindEvents(consumer: Consumer) {
     const registeredPatterns = [...this.messageHandlers.keys()];
     const consumerSubscribeOptions = this.options.subscribe || {};
-    const subscribeToPattern = async (pattern: string) =>
-      consumer.subscribe({
-        topic: pattern,
+
+    if (registeredPatterns.length > 0) {
+      await this.consumer.subscribe({
         ...consumerSubscribeOptions,
+        topics: registeredPatterns,
       });
-    await Promise.all(registeredPatterns.map(subscribeToPattern));
+    }
 
     const consumerRunOptions = Object.assign(this.options.run || {}, {
       eachMessage: this.getMessageHandler(),
@@ -126,33 +144,37 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
     replyTopic: string,
     replyPartition: string,
     correlationId: string,
-  ): (data: any) => any {
+  ): (data: any) => Promise<RecordMetadata[]> {
     return (data: any) =>
       this.sendMessage(data, replyTopic, replyPartition, correlationId);
   }
 
   public async handleMessage(payload: EachMessagePayload) {
     const channel = payload.topic;
-    const rawMessage = KafkaParser.parse<KafkaMessage>(
+    const rawMessage = this.parser.parse<KafkaMessage>(
       Object.assign(payload.message, {
         topic: payload.topic,
         partition: payload.partition,
       }),
     );
-    const headers = (rawMessage.headers as unknown) as Record<string, any>;
+    const headers = rawMessage.headers as unknown as Record<string, any>;
     const correlationId = headers[KafkaHeaders.CORRELATION_ID];
     const replyTopic = headers[KafkaHeaders.REPLY_TOPIC];
     const replyPartition = headers[KafkaHeaders.REPLY_PARTITION];
 
-    const packet = this.deserializer.deserialize(rawMessage, { channel });
+    const packet = await this.deserializer.deserialize(rawMessage, { channel });
     const kafkaContext = new KafkaContext([
       rawMessage,
       payload.partition,
       payload.topic,
+      this.consumer,
+      payload.heartbeat,
+      this.producer,
     ]);
+    const handler = this.getHandlerByPattern(packet.pattern);
     // if the correlation id or reply topic is not set
     // then this is an event (events could still have correlation id)
-    if (!correlationId || !replyTopic) {
+    if (handler?.isEventHandler || !correlationId || !replyTopic) {
       return this.handleEvent(packet.pattern, packet, kafkaContext);
     }
 
@@ -161,7 +183,7 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
       replyPartition,
       correlationId,
     );
-    const handler = this.getHandlerByPattern(packet.pattern);
+
     if (!handler) {
       return publish({
         id: correlationId,
@@ -170,18 +192,50 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
     }
 
     const response$ = this.transformToObservable(
-      await handler(packet.data, kafkaContext),
-    ) as Observable<any>;
-    response$ && this.send(response$, publish);
+      handler(packet.data, kafkaContext),
+    );
+
+    const replayStream$ = new ReplaySubject();
+    await this.combineStreamsAndThrowIfRetriable(response$, replayStream$);
+
+    this.send(replayStream$, publish);
   }
 
-  public sendMessage(
+  private combineStreamsAndThrowIfRetriable(
+    response$: Observable<any>,
+    replayStream$: ReplaySubject<unknown>,
+  ) {
+    return new Promise<void>((resolve, reject) => {
+      let isPromiseResolved = false;
+      response$.subscribe({
+        next: val => {
+          replayStream$.next(val);
+          if (!isPromiseResolved) {
+            isPromiseResolved = true;
+            resolve();
+          }
+        },
+        error: err => {
+          if (err instanceof KafkaRetriableException && !isPromiseResolved) {
+            isPromiseResolved = true;
+            reject(err);
+          } else {
+            resolve();
+          }
+          replayStream$.error(err);
+        },
+        complete: () => replayStream$.complete(),
+      });
+    });
+  }
+
+  public async sendMessage(
     message: OutgoingResponse,
     replyTopic: string,
     replyPartition: string,
     correlationId: string,
-  ): void {
-    const outgoingMessage = this.serializer.serialize(message.response);
+  ): Promise<RecordMetadata[]> {
+    const outgoingMessage = await this.serializer.serialize(message.response);
     this.assignReplyPartition(replyPartition, outgoingMessage);
     this.assignCorrelationIdHeader(correlationId, outgoingMessage);
     this.assignErrorHeader(message, outgoingMessage);
@@ -194,7 +248,7 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
       },
       this.options.send || {},
     );
-    this.producer.send(replyMessage);
+    return this.producer.send(replyMessage);
   }
 
   public assignIsDisposedHeader(
@@ -214,18 +268,20 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
     if (!outgoingResponse.err) {
       return;
     }
-    outgoingMessage.headers[KafkaHeaders.NEST_ERR] = Buffer.from(
-      outgoingResponse.err,
-    );
+    const stringifiedError =
+      typeof outgoingResponse.err === 'object'
+        ? JSON.stringify(outgoingResponse.err)
+        : outgoingResponse.err;
+    outgoingMessage.headers[KafkaHeaders.NEST_ERR] =
+      Buffer.from(stringifiedError);
   }
 
   public assignCorrelationIdHeader(
     correlationId: string,
     outgoingMessage: Message,
   ) {
-    outgoingMessage.headers[KafkaHeaders.CORRELATION_ID] = Buffer.from(
-      correlationId,
-    );
+    outgoingMessage.headers[KafkaHeaders.CORRELATION_ID] =
+      Buffer.from(correlationId);
   }
 
   public assignReplyPartition(
@@ -238,8 +294,27 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
     outgoingMessage.partition = parseFloat(replyPartition);
   }
 
+  public async handleEvent(
+    pattern: string,
+    packet: ReadPacket,
+    context: KafkaContext,
+  ): Promise<any> {
+    const handler = this.getHandlerByPattern(pattern);
+    if (!handler) {
+      return this.logger.error(NO_EVENT_HANDLER`${pattern}`);
+    }
+    const resultOrStream = await handler(packet.data, context);
+    if (isObservable(resultOrStream)) {
+      await lastValueFrom(resultOrStream);
+    }
+  }
+
   protected initializeSerializer(options: KafkaOptions['options']) {
     this.serializer =
       (options && options.serializer) || new KafkaRequestSerializer();
+  }
+
+  protected initializeDeserializer(options: KafkaOptions['options']) {
+    this.deserializer = options?.deserializer ?? new KafkaRequestDeserializer();
   }
 }

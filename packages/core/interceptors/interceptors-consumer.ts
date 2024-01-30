@@ -5,7 +5,8 @@ import {
   Controller,
 } from '@nestjs/common/interfaces';
 import { isEmpty } from '@nestjs/common/utils/shared.utils';
-import { defer, from as fromPromise, Observable } from 'rxjs';
+import { AsyncResource } from 'async_hooks';
+import { Observable, defer, from as fromPromise } from 'rxjs';
 import { mergeAll, switchMap } from 'rxjs/operators';
 import { ExecutionContextHost } from '../helpers/execution-context-host';
 
@@ -24,17 +25,16 @@ export class InterceptorsConsumer {
     const context = this.createContext(args, instance, callback);
     context.setType<TContext>(type);
 
-    const start$ = defer(() => this.transformDeffered(next));
-    const nextFn = (i = 0) => async () => {
+    const nextFn = async (i = 0) => {
       if (i >= interceptors.length) {
-        return start$;
+        return defer(AsyncResource.bind(() => this.transformDeferred(next)));
       }
       const handler: CallHandler = {
-        handle: () => fromPromise(nextFn(i + 1)()).pipe(mergeAll()),
+        handle: () => fromPromise(nextFn(i + 1)).pipe(mergeAll()),
       };
       return interceptors[i].intercept(context, handler);
     };
-    return nextFn()();
+    return defer(() => nextFn()).pipe(mergeAll());
   }
 
   public createContext(
@@ -49,11 +49,11 @@ export class InterceptorsConsumer {
     );
   }
 
-  public transformDeffered(next: () => Promise<any>): Observable<any> {
+  public transformDeferred(next: () => Promise<any>): Observable<any> {
     return fromPromise(next()).pipe(
       switchMap(res => {
-        const isDeffered = res instanceof Promise || res instanceof Observable;
-        return isDeffered ? res : Promise.resolve(res);
+        const isDeferred = res instanceof Promise || res instanceof Observable;
+        return isDeferred ? res : Promise.resolve(res);
       }),
     );
   }

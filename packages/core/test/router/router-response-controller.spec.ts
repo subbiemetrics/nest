@@ -1,8 +1,10 @@
 import { isNil, isObject } from '@nestjs/common/utils/shared.utils';
 import { expect } from 'chai';
-import { of } from 'rxjs';
+import { IncomingMessage, ServerResponse } from 'http';
+import { Observable, of, Subject } from 'rxjs';
 import * as sinon from 'sinon';
-import { RequestMethod, HttpStatus } from '../../../common';
+import { PassThrough, Writable } from 'stream';
+import { HttpStatus, RequestMethod } from '../../../common';
 import { RouterResponseController } from '../../router/router-response-controller';
 import { NoopHttpAdapter } from '../utils/noop-adapter.spec';
 
@@ -67,35 +69,44 @@ describe('RouterResponseController', () => {
   });
 
   describe('transformToResult', () => {
-    describe('when resultOrDeffered', () => {
+    describe('when resultOrDeferred', () => {
       describe('is Promise', () => {
-        it('should returns Promise', async () => {
+        it('should return Promise that resolves to the value resolved by the input Promise', async () => {
           const value = 100;
           expect(
             await routerResponseController.transformToResult(
               Promise.resolve(value),
             ),
-          ).to.be.eq(100);
+          ).to.be.eq(value);
         });
       });
 
       describe('is Observable', () => {
-        it('should returns toPromise', async () => {
+        it('should return toPromise', async () => {
           const lastValue = 100;
           expect(
             await routerResponseController.transformToResult(
               of(1, 2, 3, lastValue),
             ),
-          ).to.be.eq(100);
+          ).to.be.eq(lastValue);
         });
       });
 
-      describe('is value', () => {
-        it('should returns Promise', async () => {
+      describe('is an object that has the method `subscribe`', () => {
+        it('should return a Promise that resolves to the input value', async () => {
+          const value = { subscribe() {} };
+          expect(
+            await routerResponseController.transformToResult(value),
+          ).to.equal(value);
+        });
+      });
+
+      describe('is an ordinary value', () => {
+        it('should return a Promise that resolves to the input value', async () => {
           const value = 100;
           expect(
             await routerResponseController.transformToResult(value),
-          ).to.be.eq(100);
+          ).to.be.eq(value);
         });
       });
     });
@@ -103,14 +114,14 @@ describe('RouterResponseController', () => {
 
   describe('getStatusByMethod', () => {
     describe('when RequestMethod is POST', () => {
-      it('should returns 201', () => {
+      it('should return 201', () => {
         expect(
           routerResponseController.getStatusByMethod(RequestMethod.POST),
         ).to.be.eql(201);
       });
     });
     describe('when RequestMethod is not POST', () => {
-      it('should returns 200', () => {
+      it('should return 200', () => {
         expect(
           routerResponseController.getStatusByMethod(RequestMethod.GET),
         ).to.be.eql(200);
@@ -244,6 +255,188 @@ describe('RouterResponseController', () => {
           url: 'redirect url',
         });
         expect(redirectSpy.firstCall.args[2]).to.be.eql('redirect url');
+      });
+    });
+  });
+  describe('Server-Sent-Events', () => {
+    it('should accept only observables', async () => {
+      const result = Promise.resolve('test');
+      try {
+        await routerResponseController.sse(
+          result as unknown as any,
+          {} as unknown as ServerResponse,
+          {} as unknown as IncomingMessage,
+        );
+      } catch (e) {
+        expect(e.message).to.eql(
+          'You must return an Observable stream to use Server-Sent Events (SSE).',
+        );
+      }
+    });
+
+    it('should write string', async () => {
+      class Sink extends Writable {
+        private readonly chunks: string[] = [];
+
+        _write(
+          chunk: any,
+          encoding: string,
+          callback: (error?: Error | null) => void,
+        ): void {
+          this.chunks.push(chunk);
+          callback();
+        }
+
+        get content() {
+          return this.chunks.join('');
+        }
+      }
+
+      const written = (stream: Writable) =>
+        new Promise((resolve, reject) =>
+          stream.on('error', reject).on('finish', resolve),
+        );
+
+      const result = of('test');
+      const response = new Sink();
+      const request = new PassThrough();
+      routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+      request.destroy();
+      await written(response);
+      expect(response.content).to.eql(
+        `
+id: 1
+data: test
+
+`,
+      );
+    });
+
+    it('should close on request close', done => {
+      const result = of('test');
+      const response = new Writable();
+      response.end = () => done() as any;
+      response._write = () => {};
+
+      const request = new Writable();
+      request._write = () => {};
+
+      routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+      request.emit('close');
+    });
+
+    it('should close the request when observable completes', done => {
+      const result = of('test');
+      const response = new Writable();
+      response.end = done as any;
+      response._write = () => {};
+
+      const request = new Writable();
+      request._write = () => {};
+
+      routerResponseController.sse(
+        result,
+        response as unknown as ServerResponse,
+        request as unknown as IncomingMessage,
+      );
+    });
+
+    it('should allow to intercept the response', done => {
+      const result = sinon.spy();
+      const response = new Writable();
+      response.end();
+      response._write = () => {};
+
+      const request = new Writable();
+      request._write = () => {};
+
+      try {
+        routerResponseController.sse(
+          result as unknown as Observable<string>,
+          response as unknown as ServerResponse,
+          request as unknown as IncomingMessage,
+        );
+      } catch {
+        // Whether an error is thrown or not
+        // is not relevant, so long as
+        // result is not called
+      }
+
+      sinon.assert.notCalled(result);
+      done();
+    });
+
+    describe('when there is an error', () => {
+      it('should close the request', done => {
+        const result = new Subject();
+        const response = new Writable();
+        response.end = done as any;
+        response._write = () => {};
+
+        const request = new Writable();
+        request._write = () => {};
+
+        routerResponseController.sse(
+          result,
+          response as unknown as ServerResponse,
+          request as unknown as IncomingMessage,
+        );
+
+        result.error(new Error('Some error'));
+      });
+
+      it('should write the error message to the stream', async () => {
+        class Sink extends Writable {
+          private readonly chunks: string[] = [];
+
+          _write(
+            chunk: any,
+            encoding: string,
+            callback: (error?: Error | null) => void,
+          ): void {
+            this.chunks.push(chunk);
+            callback();
+          }
+
+          get content() {
+            return this.chunks.join('');
+          }
+        }
+
+        const written = (stream: Writable) =>
+          new Promise((resolve, reject) =>
+            stream.on('error', reject).on('finish', resolve),
+          );
+
+        const result = new Subject();
+        const response = new Sink();
+        const request = new PassThrough();
+        routerResponseController.sse(
+          result,
+          response as unknown as ServerResponse,
+          request as unknown as IncomingMessage,
+        );
+
+        result.error(new Error('Some error'));
+        request.destroy();
+
+        await written(response);
+        expect(response.content).to.eql(
+          `
+event: error
+id: 1
+data: Some error
+
+`,
+        );
       });
     });
   });

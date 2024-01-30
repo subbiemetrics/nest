@@ -1,12 +1,12 @@
+import * as GRPC from '@grpc/grpc-js';
 import * as ProtoLoader from '@grpc/proto-loader';
 import { INestApplication } from '@nestjs/common';
-import { Transport } from '@nestjs/microservices';
+import { MicroserviceOptions, Transport } from '@nestjs/microservices';
 import { ExpressAdapter } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import { fail } from 'assert';
 import { expect } from 'chai';
 import * as express from 'express';
-import * as GRPC from 'grpc';
 import { join } from 'path';
 import * as request from 'supertest';
 import { AdvancedGrpcController } from '../src/grpc-advanced/advanced.grpc.controller';
@@ -26,7 +26,7 @@ describe('Advanced GRPC transport', () => {
     /*
      *  Create microservice configuration
      */
-    app.connectMicroservice({
+    app.connectMicroservice<MicroserviceOptions>({
       transport: Transport.GRPC,
       options: {
         url: 'localhost:5001',
@@ -39,7 +39,7 @@ describe('Advanced GRPC transport', () => {
       },
     });
     // Start gRPC microservice
-    await app.startAllMicroservicesAsync();
+    await app.startAllMicroservices();
     await app.init();
     // Load proto-buffers for test gRPC dispatch
     const proto = ProtoLoader.loadSync('root.proto', {
@@ -113,6 +113,11 @@ describe('Advanced GRPC transport', () => {
   it('GRPC Sending and receiving Stream from RX handler', async () => {
     const callHandler = client.sync();
 
+    // Get Set-Cookie from Metadata
+    callHandler.on('metadata', (metadata: GRPC.Metadata) => {
+      expect(metadata.get('Set-Cookie')[0]).to.eq('test_cookie=abcd');
+    });
+
     callHandler.on('data', (msg: number) => {
       // Do deep comparison (to.eql)
       expect(msg).to.eql({
@@ -129,7 +134,7 @@ describe('Advanced GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
@@ -161,7 +166,7 @@ describe('Advanced GRPC transport', () => {
     callHandler.on('error', (err: any) => {
       // We want to fail only on real errors while Cancellation error
       // is expected
-      if (String(err).toLowerCase().indexOf('cancelled') === -1) {
+      if (!String(err).toLowerCase().includes('cancelled')) {
         fail('gRPC Stream error happened, error: ' + err);
       }
     });
